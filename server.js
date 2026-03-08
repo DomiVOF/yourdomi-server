@@ -117,20 +117,43 @@ const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
 
 async function fetchPageFromTV(page = 1, size = 50) {
-  // Use same URL format as the working frontend
+  // Try multiple URL formats
   const STATUS_IDS = [
     "bb9d1b1b-05ea-4a98-bb54-87084c38da4e",
     "ed624155-305e-4da3-83a0-e4c586ca7b81",
     "f9305a29-0508-4e24-8615-f83bd4bf84a7",
   ].join(",");
-  const url = `https://linked.toerismevlaanderen.be/lodgings?filter[registrations][registration-status][:id:]=${STATUS_IDS}&filter[registrations][type][:uri:]=http://linked.toerismevlaanderen.be/id/concepts/${TV_TYPE}&page[size]=${size}&page[number]=${page}&sort=name`;
-  console.log(`[sync] Fetching: ${url.substring(0, 120)}...`);
-  const res = await fetch(url, {
-    headers: { Accept: "application/vnd.api+json" },
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!res.ok) throw new Error(`TV API ${res.status}: ${await res.text()}`);
-  return res.json();
+
+  const urls = [
+    `https://linked.toerismevlaanderen.be/lodgings?filter[registrations][registration-status][:id:]=${STATUS_IDS}&filter[registrations][type][:uri:]=http://linked.toerismevlaanderen.be/id/concepts/${TV_TYPE}&page[size]=${size}&page[number]=${page}&sort=name`,
+    `https://linked.toerismevlaanderen.be/lodgings?filter[type]=${TV_TYPE}&page[size]=${size}&page[number]=${page}`,
+    `https://linked.toerismevlaanderen.be/lodgings?page[size]=${size}&page[number]=${page}`,
+  ];
+
+  for (const url of urls) {
+    console.log(`[sync] Trying: ${url.substring(0, 100)}...`);
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Accept: "application/vnd.api+json",
+          "User-Agent": "YourdomiServer/1.0",
+        },
+        signal: AbortSignal.timeout(20000),
+      });
+      console.log(`[sync] Response status: ${res.status}`);
+      if (!res.ok) {
+        const txt = await res.text();
+        console.log(`[sync] Error body: ${txt.substring(0, 200)}`);
+        continue;
+      }
+      const data = await res.json();
+      console.log(`[sync] Got data items: ${(data.data || []).length}, meta:`, JSON.stringify(data.meta || {}));
+      if ((data.data || []).length > 0) return data;
+    } catch(e) {
+      console.log(`[sync] Fetch error: ${e.message}`);
+    }
+  }
+  throw new Error("All TV API URLs failed");
 }
 
 async function syncPropertiesFromTV() {
@@ -155,6 +178,12 @@ async function syncPropertiesFromTV() {
       if (!total) {
         total = data.meta?.count || data.meta?.total || 0;
         console.log(`[sync] Total properties: ${total}`);
+        console.log(`[sync] Meta:`, JSON.stringify(data.meta || {}));
+        console.log(`[sync] Data length:`, (data.data || []).length);
+        if (total === 0) {
+          console.log(`[sync] Response keys:`, Object.keys(data).join(", "));
+          break;
+        }
       }
       const items = data.data || [];
       if (items.length === 0) break;
