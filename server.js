@@ -275,8 +275,12 @@ app.get("/api/panden/count", (req, res) => {
   res.json({ total, lastFetch });
 });
 
-// POST /api/sync — trigger manual sync
+// POST or GET /api/sync — trigger manual sync
 app.post("/api/sync", async (req, res) => {
+  res.json({ ok: true, message: "Sync started in background" });
+  syncPropertiesFromTV().catch(console.error);
+});
+app.get("/api/sync", async (req, res) => {
   res.json({ ok: true, message: "Sync started in background" });
   syncPropertiesFromTV().catch(console.error);
 });
