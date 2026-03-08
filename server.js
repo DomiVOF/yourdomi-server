@@ -1,0 +1,314 @@
+const express = require("express");
+const cors = require("cors");
+const Database = require("better-sqlite3");
+const fetch = require("node-fetch");
+const cron = require("node-cron");
+const path = require("path");
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || "*";
+const AI_STALE_DAYS = parseInt(process.env.AI_STALE_DAYS || "100");
+
+// ── DATABASE ─────────────────────────────────────────────────────────────────
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, "yourdomi.db");
+const db = new Database(DB_PATH);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS properties (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS enrichment (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    enriched_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS outcomes (
+    id TEXT PRIMARY KEY,
+    outcome TEXT,
+    note TEXT,
+    contact_naam TEXT,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_enrichment_age ON enrichment(enriched_at);
+`);
+
+app.use(cors({ origin: FRONTEND_URL }));
+app.use(express.json({ limit: "2mb" }));
+
+// ── TOERISME VLAANDEREN FETCH ─────────────────────────────────────────────────
+const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
+const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
+
+async function fetchPageFromTV(page = 1, size = 50) {
+  const offset = (page - 1) * size;
+  const url = `${TV_BASE}?filter[type]=${TV_TYPE}&page[size]=${size}&page[offset]=${offset}`;
+  const res = await fetch(url, {
+    headers: { Accept: "application/vnd.api+json" },
+    timeout: 15000,
+  });
+  if (!res.ok) throw new Error(`TV API ${res.status}`);
+  return res.json();
+}
+
+async function syncPropertiesFromTV() {
+  console.log("[sync] Starting property sync from Toerisme Vlaanderen...");
+  let page = 1;
+  let total = null;
+  let synced = 0;
+  const now = Date.now();
+
+  const insert = db.prepare(
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at) VALUES (?, ?, ?)"
+  );
+  const insertMany = db.transaction((items) => {
+    for (const item of items) {
+      insert.run(item.id, JSON.stringify(item), now);
+    }
+  });
+
+  try {
+    while (true) {
+      const data = await fetchPageFromTV(page, 50);
+      if (!total) {
+        total = data.meta?.count || data.meta?.total || 0;
+        console.log(`[sync] Total properties: ${total}`);
+      }
+      const items = data.data || [];
+      if (items.length === 0) break;
+
+      // Store raw items with included for later parsing
+      const toStore = items.map((item) => ({
+        id: item.id,
+        raw: item,
+        included: data.included || [],
+      }));
+      insertMany(toStore.map((i) => ({ id: i.id, ...i })));
+      synced += items.length;
+
+      console.log(`[sync] Page ${page}: ${synced}/${total}`);
+
+      if (synced >= total) break;
+      page++;
+      // Small delay to be respectful to TV API
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    console.log(`[sync] Done. Synced ${synced} properties.`);
+  } catch (e) {
+    console.error("[sync] Error:", e.message);
+  }
+}
+
+// ── PARSE LODGING (same logic as frontend) ───────────────────────────────────
+function parseLodging(raw, included = []) {
+  const attr = raw.attributes || {};
+  const rel = raw.relationships || {};
+
+  const getIncluded = (type, id) =>
+    included.find((i) => i.type === type && i.id === id);
+
+  // Municipality
+  let municipality = "";
+  let province = "";
+  const muniRef = rel.municipality?.data;
+  if (muniRef) {
+    const muni = getIncluded(muniRef.type, muniRef.id);
+    municipality = muni?.attributes?.name || "";
+    const provRef = muni?.relationships?.province?.data;
+    if (provRef) {
+      const prov = getIncluded(provRef.type, provRef.id);
+      province = prov?.attributes?.name || "";
+    }
+  }
+
+  // Contact
+  const contactInfo = attr["schema:contactPoint"] || [];
+  const phones = [], emails = [], websites = [];
+  (Array.isArray(contactInfo) ? contactInfo : [contactInfo]).forEach((c) => {
+    if (!c) return;
+    if (c["schema:telephone"]) phones.push(c["schema:telephone"]);
+    if (c["schema:email"]) emails.push(c["schema:email"]);
+    if (c["schema:url"]) websites.push(c["schema:url"]);
+  });
+  const cleanPhone = (p) => p?.replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32") || "";
+  const phone = phones[0] ? cleanPhone(phones[0]) : "";
+  const phoneNorm = phone.replace(/[^0-9+]/g, "");
+
+  // Images
+  const mediaRefs = rel.media?.data || [];
+  const images = mediaRefs
+    .map((m) => getIncluded(m.type, m.id)?.attributes?.contentUrl)
+    .filter(Boolean)
+    .slice(0, 5);
+
+  return {
+    id: raw.id,
+    name: attr["schema:name"] || attr.name || `Pand ${raw.id.slice(-6)}`,
+    municipality,
+    province,
+    postalCode: attr["schema:address"]?.["schema:postalCode"] || "",
+    street: attr["schema:address"]?.["schema:streetAddress"] || "",
+    slaapplaatsen: attr["schema:numberOfRooms"] || attr.numberOfSleepingPlaces || 0,
+    phone,
+    phoneNorm,
+    email: emails[0] || "",
+    website: websites[0] || "",
+    images,
+    status: attr.registrationStatus || attr.status || "",
+    type: attr["dcterms:type"] || "",
+  };
+}
+
+// ── API ROUTES ────────────────────────────────────────────────────────────────
+
+// GET /api/panden?page=1&size=50&gemeente=Gent&provincie=...
+app.get("/api/panden", (req, res) => {
+  const page = parseInt(req.query.page || "1");
+  const size = Math.min(parseInt(req.query.size || "50"), 200);
+  const offset = (page - 1) * size;
+
+  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+
+  if (total === 0) {
+    return res.json({
+      data: [],
+      meta: { total: 0, page, size },
+      _needsSync: true,
+    });
+  }
+
+  const rows = db
+    .prepare("SELECT data FROM properties LIMIT ? OFFSET ?")
+    .all(size, offset);
+
+  const properties = rows.map((r) => {
+    const parsed = JSON.parse(r.data);
+    return parseLodging(parsed.raw || parsed, parsed.included || []);
+  });
+
+  res.json({
+    data: properties,
+    meta: { total, page, size, pages: Math.ceil(total / size) },
+  });
+});
+
+// GET /api/panden/count
+app.get("/api/panden/count", (req, res) => {
+  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
+  res.json({ total, lastFetch });
+});
+
+// POST /api/sync — trigger manual sync
+app.post("/api/sync", async (req, res) => {
+  res.json({ ok: true, message: "Sync started in background" });
+  syncPropertiesFromTV().catch(console.error);
+});
+
+// GET /api/enrichment/:id
+app.get("/api/enrichment/:id", (req, res) => {
+  const row = db.prepare("SELECT data, enriched_at FROM enrichment WHERE id = ?").get(req.params.id);
+  if (!row) return res.json(null);
+  res.json({ ...JSON.parse(row.data), _enrichedAt: row.enriched_at });
+});
+
+// GET /api/enrichment — get all (for bulk load)
+app.get("/api/enrichment", (req, res) => {
+  const rows = db.prepare("SELECT id, data, enriched_at FROM enrichment").all();
+  const result = {};
+  for (const row of rows) {
+    result[row.id] = { ...JSON.parse(row.data), _enrichedAt: row.enriched_at };
+  }
+  res.json(result);
+});
+
+// POST /api/enrichment/:id — save enrichment result
+app.post("/api/enrichment/:id", (req, res) => {
+  const data = req.body;
+  if (!data || typeof data !== "object") return res.status(400).json({ error: "Invalid data" });
+  db.prepare("INSERT OR REPLACE INTO enrichment (id, data, enriched_at) VALUES (?, ?, ?)").run(
+    req.params.id,
+    JSON.stringify(data),
+    Date.now()
+  );
+  res.json({ ok: true });
+});
+
+// GET /api/enrichment/stale — get IDs that need re-enrichment
+app.get("/api/enrichment/stale", (req, res) => {
+  const cutoff = Date.now() - AI_STALE_DAYS * 24 * 60 * 60 * 1000;
+  // Properties with no enrichment or enrichment older than AI_STALE_DAYS
+  const staleRows = db.prepare("SELECT id FROM enrichment WHERE enriched_at < ?").all(cutoff);
+  const enrichedIds = new Set(db.prepare("SELECT id FROM enrichment").all().map((r) => r.id));
+  const allIds = db.prepare("SELECT id FROM properties").all().map((r) => r.id);
+  const unenriched = allIds.filter((id) => !enrichedIds.has(id));
+  const stale = staleRows.map((r) => r.id);
+  res.json({ stale: [...stale, ...unenriched].slice(0, 200) });
+});
+
+// GET /api/outcomes — all outcomes + notes
+app.get("/api/outcomes", (req, res) => {
+  const rows = db.prepare("SELECT * FROM outcomes").all();
+  const result = {};
+  for (const row of rows) {
+    result[row.id] = {
+      outcome: row.outcome,
+      note: row.note,
+      contactNaam: row.contact_naam,
+      updatedAt: row.updated_at,
+    };
+  }
+  res.json(result);
+});
+
+// POST /api/outcomes/:id
+app.post("/api/outcomes/:id", (req, res) => {
+  const { outcome, note, contactNaam } = req.body;
+  db.prepare(
+    "INSERT OR REPLACE INTO outcomes (id, outcome, note, contact_naam, updated_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(req.params.id, outcome || null, note || null, contactNaam || null, Date.now());
+  res.json({ ok: true });
+});
+
+// GET /api/health
+app.get("/api/health", (req, res) => {
+  const propCount = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  const enrichCount = db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c;
+  const outcomeCount = db.prepare("SELECT COUNT(*) as c FROM outcomes").get().c;
+  res.json({
+    ok: true,
+    properties: propCount,
+    enrichments: enrichCount,
+    outcomes: outcomeCount,
+    staleAfterDays: AI_STALE_DAYS,
+  });
+});
+
+// ── CRON: weekly property sync, daily stale re-enrichment check ───────────────
+// Every Sunday at 03:00 — re-sync all properties from TV
+cron.schedule("0 3 * * 0", () => {
+  console.log("[cron] Weekly property sync starting...");
+  syncPropertiesFromTV().catch(console.error);
+});
+
+// ── START ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`YourDomi server running on port ${PORT}`);
+  console.log(`DB: ${DB_PATH}`);
+  console.log(`AI stale after: ${AI_STALE_DAYS} days`);
+
+  // If DB is empty, kick off initial sync
+  const count = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  if (count === 0) {
+    console.log("[startup] Empty DB — starting initial TV sync...");
+    syncPropertiesFromTV().catch(console.error);
+  } else {
+    console.log(`[startup] DB has ${count} properties.`);
+  }
+});
