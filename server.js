@@ -116,9 +116,9 @@ const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
 
 async function fetchPageFromTV(page = 1, size = 100) {
-  // Fetch ALL vacation rentals - no status filter
-  const url = `https://linked.toerismevlaanderen.be/lodgings?filter[registrations][type][:uri:]=http://linked.toerismevlaanderen.be/id/concepts/${TV_TYPE}&page[size]=${size}&page[number]=${page}`;
-  console.log(`[sync] Fetching page ${page}: ${url.substring(0, 100)}...`);
+  // Fetch ALL lodgings - no type or status filter
+  const url = `https://linked.toerismevlaanderen.be/lodgings?page[size]=${size}&page[number]=${page}`;
+  console.log(`[sync] Fetching page ${page}: ${url}`);
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
     signal: AbortSignal.timeout(30000),
@@ -274,6 +274,7 @@ app.get("/api/panden", (req, res) => {
   if (status) properties = properties.filter(p => p.status === status);
   if (minSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) >= parseInt(minSlaap));
   if (maxSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) <= parseInt(maxSlaap));
+  if (req.query.type) properties = properties.filter(p => p.type === req.query.type);
   if (heeftTelefoon === "1") properties = properties.filter(p => !!p.phone);
   if (heeftEmail === "1") properties = properties.filter(p => !!p.email);
   if (heeftWebsite === "1") properties = properties.filter(p => !!p.website);
@@ -375,12 +376,33 @@ app.get("/api/health", (req, res) => {
   const propCount = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const enrichCount = db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c;
   const outcomeCount = db.prepare("SELECT COUNT(*) as c FROM outcomes").get().c;
+  const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get()?.t;
   res.json({
     ok: true,
     properties: propCount,
     enrichments: enrichCount,
     outcomes: outcomeCount,
     staleAfterDays: AI_STALE_DAYS,
+    lastSync: lastFetch ? new Date(lastFetch).toISOString() : null,
+  });
+});
+
+// GET /api/meta - unique provinces, types for filter dropdowns
+app.get("/api/meta", (req, res) => {
+  const rows = db.prepare("SELECT data FROM properties").all();
+  const provinces = new Set();
+  const types = new Set();
+  for (const r of rows) {
+    try {
+      const p = JSON.parse(r.data);
+      const parsed = parseLodging(p.raw || p, p.included || []);
+      if (parsed.province) provinces.add(parsed.province);
+      if (parsed.type) types.add(parsed.type);
+    } catch {}
+  }
+  res.json({
+    provinces: [...provinces].sort(),
+    types: [...types].sort(),
   });
 });
 
