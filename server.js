@@ -81,7 +81,7 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "*";
 const AI_STALE_DAYS = parseInt(process.env.AI_STALE_DAYS || "100");
 
 // ── DATABASE ─────────────────────────────────────────────────────────────────
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "yourdomi.db");
+const DB_PATH = process.env.DB_PATH || "/data/yourdomi.db";
 let db; // initialized async below
 
 // DB initialized in startServer()
@@ -117,13 +117,19 @@ const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
 
 async function fetchPageFromTV(page = 1, size = 50) {
-  const offset = (page - 1) * size;
-  const url = `${TV_BASE}?filter[type]=${TV_TYPE}&page[size]=${size}&page[offset]=${offset}`;
+  // Use same URL format as the working frontend
+  const STATUS_IDS = [
+    "bb9d1b1b-05ea-4a98-bb54-87084c38da4e",
+    "ed624155-305e-4da3-83a0-e4c586ca7b81",
+    "f9305a29-0508-4e24-8615-f83bd4bf84a7",
+  ].join(",");
+  const url = `https://linked.toerismevlaanderen.be/lodgings?filter[registrations][registration-status][:id:]=${STATUS_IDS}&filter[registrations][type][:uri:]=http://linked.toerismevlaanderen.be/id/concepts/${TV_TYPE}&page[size]=${size}&page[number]=${page}&sort=name`;
+  console.log(`[sync] Fetching: ${url.substring(0, 120)}...`);
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json" },
-    timeout: 15000,
+    signal: AbortSignal.timeout(20000),
   });
-  if (!res.ok) throw new Error(`TV API ${res.status}`);
+  if (!res.ok) throw new Error(`TV API ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
