@@ -1,0 +1,5 @@
+node_modules/
+yourdomi.db
+*.db-shm
+*.db-wal
+.env

@@ -1,6 +1,75 @@
 const express = require("express");
 const cors = require("cors");
-const Database = require("better-sqlite3");
+const initSqlJs = require('sql.js');
+const fs = require('fs');
+
+// sql.js wrapper that mimics better-sqlite3 API
+let _db = null;
+let _dbPath = null;
+
+function getDb() { return _db; }
+
+async function initDb(dbPath) {
+  _dbPath = dbPath;
+  const SQL = await initSqlJs();
+  if (fs.existsSync(dbPath)) {
+    const fileBuffer = fs.readFileSync(dbPath);
+    _db = new SQL.Database(fileBuffer);
+  } else {
+    _db = new SQL.Database();
+  }
+  // Persist to disk after every write
+  return _db;
+}
+
+function saveDb() {
+  if (_db && _dbPath) {
+    const data = _db.export();
+    fs.writeFileSync(_dbPath, Buffer.from(data));
+  }
+}
+
+// Minimal better-sqlite3 compatible wrapper
+class Statement {
+  constructor(db, sql) { this.db = db; this.sql = sql; }
+  run(...args) {
+    this.db.run(this.sql, args.flat());
+    saveDb();
+    return { changes: 1 };
+  }
+  get(...args) {
+    const res = this.db.exec(this.sql, args.flat());
+    if (!res.length || !res[0].values.length) return undefined;
+    const cols = res[0].columns;
+    const row = res[0].values[0];
+    const obj = {};
+    cols.forEach((c, i) => obj[c] = row[i]);
+    return obj;
+  }
+  all(...args) {
+    const res = this.db.exec(this.sql, args.flat());
+    if (!res.length) return [];
+    const cols = res[0].columns;
+    return res[0].values.map(row => {
+      const obj = {};
+      cols.forEach((c, i) => obj[c] = row[i]);
+      return obj;
+    });
+  }
+}
+
+class Database {
+  constructor(db) { this.db = db; }
+  prepare(sql) { return new Statement(this.db, sql); }
+  exec(sql) { this.db.run(sql); saveDb(); }
+  transaction(fn) {
+    return (items) => {
+      this.db.run("BEGIN");
+      try { fn(items); this.db.run("COMMIT"); saveDb(); }
+      catch(e) { this.db.run("ROLLBACK"); throw e; }
+    };
+  }
+}
 const fetch = require("node-fetch");
 const cron = require("node-cron");
 const path = require("path");
@@ -13,9 +82,10 @@ const AI_STALE_DAYS = parseInt(process.env.AI_STALE_DAYS || "100");
 
 // ── DATABASE ─────────────────────────────────────────────────────────────────
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "yourdomi.db");
-const db = new Database(DB_PATH);
+let db; // initialized async below
 
-db.exec(`
+// DB initialized in startServer()
+const DB_SCHEMA = `
   CREATE TABLE IF NOT EXISTS properties (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL,
@@ -37,7 +107,7 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_enrichment_age ON enrichment(enriched_at);
-`);
+`;
 
 app.use(cors({ origin: FRONTEND_URL }));
 app.use(express.json({ limit: "2mb" }));
@@ -298,17 +368,24 @@ cron.schedule("0 3 * * 0", () => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`YourDomi server running on port ${PORT}`);
-  console.log(`DB: ${DB_PATH}`);
-  console.log(`AI stale after: ${AI_STALE_DAYS} days`);
+async function startServer() {
+  const sqlDb = await initDb(DB_PATH);
+  db = new Database(sqlDb);
+  db.exec(DB_SCHEMA);
 
-  // If DB is empty, kick off initial sync
-  const count = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
-  if (count === 0) {
-    console.log("[startup] Empty DB — starting initial TV sync...");
-    syncPropertiesFromTV().catch(console.error);
-  } else {
-    console.log(`[startup] DB has ${count} properties.`);
-  }
-});
+  app.listen(PORT, () => {
+    console.log(`YourDomi server running on port ${PORT}`);
+    console.log(`DB: ${DB_PATH}`);
+    console.log(`AI stale after: ${AI_STALE_DAYS} days`);
+
+    const count = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+    if (count === 0) {
+      console.log("[startup] Empty DB — starting initial TV sync...");
+      syncPropertiesFromTV().catch(console.error);
+    } else {
+      console.log(`[startup] DB has ${count} properties.`);
+    }
+  });
+}
+
+startServer().catch(console.error);
