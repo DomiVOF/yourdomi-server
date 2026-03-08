@@ -64,9 +64,15 @@ class Database {
   exec(sql) { this.db.run(sql); saveDb(); }
   transaction(fn) {
     return (items) => {
-      this.db.run("BEGIN");
-      try { fn(items); this.db.run("COMMIT"); saveDb(); }
-      catch(e) { this.db.run("ROLLBACK"); throw e; }
+      try {
+        this.db.run("BEGIN TRANSACTION");
+        fn(items);
+        this.db.run("COMMIT");
+        saveDb();
+      } catch(e) {
+        try { this.db.run("ROLLBACK"); } catch(_) {}
+        throw e;
+      }
     };
   }
 }
