@@ -64,15 +64,8 @@ class Database {
   exec(sql) { this.db.run(sql); saveDb(); }
   transaction(fn) {
     return (items) => {
-      try {
-        this.db.run("BEGIN TRANSACTION");
-        fn(items);
-        this.db.run("COMMIT");
-        saveDb();
-      } catch(e) {
-        try { this.db.run("ROLLBACK"); } catch(_) {}
-        throw e;
-      }
+      fn(items); // no transaction wrapper - sql.js auto-commits
+      saveDb();
     };
   }
 }
@@ -122,44 +115,16 @@ app.use(express.json({ limit: "2mb" }));
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
 
-async function fetchPageFromTV(page = 1, size = 50) {
-  // Try multiple URL formats
-  const STATUS_IDS = [
-    "bb9d1b1b-05ea-4a98-bb54-87084c38da4e",
-    "ed624155-305e-4da3-83a0-e4c586ca7b81",
-    "f9305a29-0508-4e24-8615-f83bd4bf84a7",
-  ].join(",");
-
-  const urls = [
-    `https://linked.toerismevlaanderen.be/lodgings?filter[registrations][registration-status][:id:]=${STATUS_IDS}&filter[registrations][type][:uri:]=http://linked.toerismevlaanderen.be/id/concepts/${TV_TYPE}&page[size]=${size}&page[number]=${page}&sort=name`,
-    `https://linked.toerismevlaanderen.be/lodgings?filter[type]=${TV_TYPE}&page[size]=${size}&page[number]=${page}`,
-    `https://linked.toerismevlaanderen.be/lodgings?page[size]=${size}&page[number]=${page}`,
-  ];
-
-  for (const url of urls) {
-    console.log(`[sync] Trying: ${url.substring(0, 100)}...`);
-    try {
-      const res = await fetch(url, {
-        headers: {
-          Accept: "application/vnd.api+json",
-          "User-Agent": "YourdomiServer/1.0",
-        },
-        signal: AbortSignal.timeout(20000),
-      });
-      console.log(`[sync] Response status: ${res.status}`);
-      if (!res.ok) {
-        const txt = await res.text();
-        console.log(`[sync] Error body: ${txt.substring(0, 200)}`);
-        continue;
-      }
-      const data = await res.json();
-      console.log(`[sync] Got data items: ${(data.data || []).length}, meta:`, JSON.stringify(data.meta || {}));
-      if ((data.data || []).length > 0) return data;
-    } catch(e) {
-      console.log(`[sync] Fetch error: ${e.message}`);
-    }
-  }
-  throw new Error("All TV API URLs failed");
+async function fetchPageFromTV(page = 1, size = 100) {
+  // Fetch ALL vacation rentals - no status filter
+  const url = `https://linked.toerismevlaanderen.be/lodgings?filter[registrations][type][:uri:]=http://linked.toerismevlaanderen.be/id/concepts/${TV_TYPE}&page[size]=${size}&page[number]=${page}`;
+  console.log(`[sync] Fetching page ${page}: ${url.substring(0, 100)}...`);
+  const res = await fetch(url, {
+    headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`TV API ${res.status}: ${await res.text()}`);
+  return res.json();
 }
 
 async function syncPropertiesFromTV() {
@@ -278,34 +243,48 @@ function parseLodging(raw, included = []) {
 
 // ── API ROUTES ────────────────────────────────────────────────────────────────
 
-// GET /api/panden?page=1&size=50&gemeente=Gent&provincie=...
+// GET /api/panden?page=1&size=50&zoek=...&gemeente=...&provincie=...&status=...&minSlaap=...&maxSlaap=...&heeftTelefoon=...&heeftEmail=...&heeftWebsite=...
 app.get("/api/panden", (req, res) => {
   const page = parseInt(req.query.page || "1");
   const size = Math.min(parseInt(req.query.size || "50"), 200);
-  const offset = (page - 1) * size;
 
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
 
-  if (total === 0) {
-    return res.json({
-      data: [],
-      meta: { total: 0, page, size },
-      _needsSync: true,
-    });
-  }
-
-  const rows = db
-    .prepare("SELECT data FROM properties LIMIT ? OFFSET ?")
-    .all(size, offset);
-
-  const properties = rows.map((r) => {
+  // Load all and filter in JS (SQLite JSON queries are complex, this is fast enough for 30k)
+  const allRows = db.prepare("SELECT data FROM properties").all();
+  let properties = allRows.map(r => {
     const parsed = JSON.parse(r.data);
     return parseLodging(parsed.raw || parsed, parsed.included || []);
   });
 
+  // Apply filters
+  const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
+
+  if (zoek) {
+    const q = zoek.toLowerCase();
+    properties = properties.filter(p =>
+      p.name?.toLowerCase().includes(q) ||
+      p.municipality?.toLowerCase().includes(q) ||
+      p.postalCode?.includes(q)
+    );
+  }
+  if (gemeente) properties = properties.filter(p => p.municipality?.toLowerCase().includes(gemeente.toLowerCase()));
+  if (provincie) properties = properties.filter(p => p.province === provincie);
+  if (status) properties = properties.filter(p => p.status === status);
+  if (minSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) >= parseInt(minSlaap));
+  if (maxSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) <= parseInt(maxSlaap));
+  if (heeftTelefoon === "1") properties = properties.filter(p => !!p.phone);
+  if (heeftEmail === "1") properties = properties.filter(p => !!p.email);
+  if (heeftWebsite === "1") properties = properties.filter(p => !!p.website);
+
+  const filteredTotal = properties.length;
+  const offset = (page - 1) * size;
+  const paged = properties.slice(offset, offset + size);
+
   res.json({
-    data: properties,
-    meta: { total, page, size, pages: Math.ceil(total / size) },
+    data: paged,
+    meta: { total: filteredTotal, dbTotal: total, page, size, pages: Math.ceil(filteredTotal / size) },
   });
 });
 
