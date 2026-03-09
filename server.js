@@ -305,8 +305,8 @@ function parseLodging(raw, included = []) {
     }
   }
   // Fallbacks from attributes
-  if (!municipality) municipality = attr["municipality-name"] || attr["schema:address"]?.["schema:addressLocality"] || attr["municipality"] || attr["address-municipality"] || attr["postal-info"] || "";
-  if (!province) province = attr["schema:address"]?.["schema:addressRegion"] || attr["province"] || "";
+  if (!municipality) municipality = attr["hoofdgemeente"] || attr["municipality-name"] || attr["schema:address"]?.["schema:addressLocality"] || attr["municipality"] || attr["address-municipality"] || attr["postal-info"] || "";
+  if (!province) province = attr["Provincie"] || attr["provincie"] || attr["schema:address"]?.["schema:addressRegion"] || attr["province"] || "";
 
   // Contact
   const contactInfo = attr["schema:contactPoint"] || [];
@@ -352,7 +352,7 @@ function parseLodging(raw, included = []) {
     province,
     toeristischeRegio,
     type,
-    postalCode: attr["schema:address"]?.["schema:postalCode"] || "",
+    postalCode: attr["postcode"] || attr["schema:address"]?.["schema:postalCode"] || "",
     street: attr["schema:address"]?.["schema:streetAddress"] || "",
     slaapplaatsen: attr["schema:numberOfRooms"] || attr.numberOfSleepingPlaces || 0,
     phone,
