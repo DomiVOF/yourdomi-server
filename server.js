@@ -324,7 +324,7 @@ function parseLodging(raw, included = []) {
   const rel = raw.relationships || {};
 
   // Name — this is what we match against the Excel lookup
-  const name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
+  let name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
 
   // Municipality — use Excel lookup: primary by registration number (from URI), fallback by name
   const uri = attr["uri"] || attr["@id"] || "";
