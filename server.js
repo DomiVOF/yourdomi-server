@@ -319,6 +319,9 @@ async function syncPropertiesFromTV() {
 }
 
 // -- PARSE LODGING (same logic as frontend) -----------------------------------
+const s = (v) => (v && typeof v === "string") ? v : (Array.isArray(v) ? v[0] || "" : (v ? String(v) : ""));
+const n = (v) => isNaN(parseInt(v)) ? 0 : parseInt(v);
+
 function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
@@ -397,28 +400,28 @@ function parseLodging(raw, included = []) {
   const dateOnline = attr["modified"] || attr["registration-date"] || attr["dcterms:created"] || "";
 
   return {
-    id: raw.id,
-    name,
-    municipality,
-    province,
-    toeristischeRegio,
-    type,
-    postalCode,
-    street: attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || "",
-    sleepPlaces: parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
-    slaapplaatsen: parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
-    units: parseInt(attr["number-of-rental-units"] || 1),
-    phone: phone || null,
-    phoneNorm,
-    email: emails[0] || null,
-    website: websites[0] || null,
-    images,
-    status: status || "aangemeld",
+    id: s(raw.id),
+    name: s(name) || "Naamloze woning",
+    municipality: s(municipality),
+    province: s(province),
+    toeristischeRegio: s(toeristischeRegio),
+    type: s(type),
+    postalCode: s(postalCode),
+    street: s(attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || ""),
+    sleepPlaces: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
+    slaapplaatsen: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
+    units: n(attr["number-of-rental-units"] || 1),
+    phone: s(phone) || null,
+    phoneNorm: s(phoneNorm) || null,
+    email: s(emails[0]) || null,
+    website: s(websites[0]) || null,
+    images: images.map(s).filter(Boolean),
+    status: s(status) || "aangemeld",
     starRating: null,
-    onlineSince: attr["modified"] || attr["registration-date"] || "",
-    dateOnline: attr["modified"] || attr["registration-date"] || "",
-    registrationNumber: raw.id,
-    category: attr["category"] || type || "vakantiewoning",
+    onlineSince: s(attr["modified"] || attr["registration-date"] || ""),
+    dateOnline: s(attr["modified"] || attr["registration-date"] || ""),
+    registrationNumber: s(raw.id),
+    category: s(attr["category"] || type || "vakantiewoning"),
     rawUrl: `https://linked.toerismevlaanderen.be/id/lodgings/${raw.id}`,
   };
 }
@@ -483,7 +486,7 @@ app.get("/api/panden", requireAuth, (req, res) => {
     console.error("[/api/panden] error:", e.message);
     res.status(500).json({ error: e.message });
   }
-});;
+});
 
 // GET /api/panden/count
 app.get("/api/panden/count", requireAuth, (req, res) => {
@@ -544,7 +547,7 @@ app.get("/api/sync", async (req, res) => {
 });
 
 // GET /api/enrichment/:id
-app.get("/api/enrichment/:id", (req, res) => {
+app.get("/api/enrichment/:id", requireAuth, (req, res) => {
   const row = db.prepare("SELECT data, enriched_at FROM enrichment WHERE id = ?").get(req.params.id);
   if (!row) return res.json(null);
   res.json({ ...JSON.parse(row.data), _enrichedAt: row.enriched_at });
@@ -573,7 +576,7 @@ app.post("/api/enrichment/:id", requireAuth, (req, res) => {
 });
 
 // GET /api/enrichment/stale - get IDs that need re-enrichment
-app.get("/api/enrichment/stale", (req, res) => {
+app.get("/api/enrichment/stale", requireAuth, (req, res) => {
   const cutoff = Date.now() - AI_STALE_DAYS * 24 * 60 * 60 * 1000;
   // Properties with no enrichment or enrichment older than AI_STALE_DAYS
   const staleRows = db.prepare("SELECT id FROM enrichment WHERE enriched_at < ?").all(cutoff);
