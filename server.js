@@ -487,6 +487,21 @@ cron.schedule("0 3 * * 0", () => {
 });
 
 // ── AUTH ENDPOINTS ───────────────────────────────────────────────────────────
+// Emergency reset — only works if ADMIN_PASSWORD env var is set in Railway
+app.post("/api/admin/reset-password", (req, res) => {
+  const adminPw = process.env.ADMIN_PASSWORD;
+  if (!adminPw) return res.status(403).json({ error: "ADMIN_PASSWORD not configured" });
+  const { adminPassword, username, newPassword } = req.body;
+  if (adminPassword !== adminPw) return res.status(403).json({ error: "Wrong admin password" });
+  if (!username || !newPassword) return res.status(400).json({ error: "username and newPassword required" });
+  const user = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  db.prepare("UPDATE users SET password_hash = ? WHERE username = ?").run(hashPassword(newPassword), username);
+  db.prepare("DELETE FROM sessions WHERE username = ?").run(username); // invalidate old sessions
+  res.json({ ok: true, message: `Password reset for ${username}` });
+});
+
+
 app.post("/api/login", (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Gebruikersnaam en wachtwoord vereist" });
