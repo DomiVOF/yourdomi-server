@@ -89,7 +89,7 @@ try {
 
 function lookupMunicipality(name, uri) {
   // Primary: match by registration number extracted from URI
-  if (uri) {
+  if (uri && typeof uri === "string") {
     const m = uri.match(/\/lodgings\/(\d+)/);
     if (m) {
       const entry = MUNI_LOOKUP.by_regnr[m[1]];
@@ -97,8 +97,8 @@ function lookupMunicipality(name, uri) {
     }
   }
   // Fallback: match by normalized name
-  if (name) {
-    const key = name.toLowerCase().trim().replace(/^['\"\s]+|['\"\s]+$/g, "").replace(/\s+/g, " ");
+  if (name && typeof name === "string") {
+    const key = name.toLowerCase().trim().replace(/^['"\s]+|['"\s]+$/g, "").replace(/\s+/g, " ");
     const entry = MUNI_LOOKUP.by_name[key];
     if (entry) return entry;
   }
