@@ -70,6 +70,23 @@ const fetch = require("node-fetch");
 const cron = require("node-cron");
 const path = require("path");
 
+// Load municipality lookup from Excel-derived JSON
+// Format: { "name lowercase": [municipality, province, postalCode, regio] }
+let MUNI_LOOKUP = {};
+try {
+  const muniPath = path.join(__dirname, "municipalities.json");
+  MUNI_LOOKUP = JSON.parse(require("fs").readFileSync(muniPath, "utf-8"));
+  console.log(`[municipalities] Loaded ${Object.keys(MUNI_LOOKUP).length} entries`);
+} catch(e) {
+  console.warn("[municipalities] Could not load municipalities.json:", e.message);
+}
+
+function lookupMunicipality(name) {
+  if (!name) return null;
+  const key = name.toLowerCase().trim();
+  return MUNI_LOOKUP[key] || null; // returns [municipality, province, postalCode, regio] or null
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
@@ -288,80 +305,96 @@ function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
 
-  const getIncluded = (type, id) =>
-    included.find((i) => i.type === type && i.id === id);
+  // Name — this is what we match against the Excel lookup
+  const name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
 
-  // Municipality
+  // Municipality — use Excel lookup as PRIMARY source (TV API list endpoint has no included data)
   let municipality = "";
   let province = "";
-  const muniRef = rel.municipality?.data;
-  if (muniRef) {
-    const muni = getIncluded(muniRef.type, muniRef.id);
-    municipality = muni?.attributes?.name || muni?.attributes?.["schema:name"] || "";
-    const provRef = muni?.relationships?.province?.data;
-    if (provRef) {
-      const prov = getIncluded(provRef.type, provRef.id);
-      province = prov?.attributes?.name || prov?.attributes?.["schema:name"] || "";
+  let postalCode = "";
+  let toeristischeRegio = "";
+
+  const luEntry = lookupMunicipality(name); // [municipality, province, postalCode, regio]
+  if (luEntry) {
+    municipality     = luEntry[0] || "";
+    province         = luEntry[1] || "";
+    postalCode       = luEntry[2] || "";
+    toeristischeRegio = luEntry[3] || "";
+  }
+
+  // Fallback: try included (works when individual property is fetched)
+  if (!municipality && included.length) {
+    const muniRef = rel.municipality?.data || rel.address?.data;
+    if (muniRef) {
+      const muni = included.find((i) => i.type === muniRef.type && i.id === muniRef.id);
+      if (muni) {
+        municipality = muni?.attributes?.name || muni?.attributes?.["schema:name"] || "";
+        const provRef = muni?.relationships?.province?.data;
+        if (provRef) {
+          const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
+          province = prov?.attributes?.name || "";
+        }
+      }
     }
   }
-  // Fallbacks from attributes
-  if (!municipality) municipality = attr["hoofdgemeente"] || attr["municipality-name"] || attr["schema:address"]?.["schema:addressLocality"] || attr["municipality"] || attr["address-municipality"] || attr["postal-info"] || "";
-  if (!province) province = attr["Provincie"] || attr["provincie"] || attr["schema:address"]?.["schema:addressRegion"] || attr["province"] || "";
 
-  // Contact
-  const contactInfo = attr["schema:contactPoint"] || [];
+  // Contact — TV API uses contact-points relationship
+  const contactPoints = rel["contact-points"]?.data || [];
   const phones = [], emails = [], websites = [];
-  (Array.isArray(contactInfo) ? contactInfo : [contactInfo]).forEach((c) => {
-    if (!c) return;
-    if (c["schema:telephone"]) phones.push(c["schema:telephone"]);
-    if (c["schema:email"]) emails.push(c["schema:email"]);
-    if (c["schema:url"]) websites.push(c["schema:url"]);
-  });
+  for (const cp of contactPoints) {
+    const c = included.find(i => i.type === cp.type && i.id === cp.id);
+    if (!c) continue;
+    const ca = c.attributes || {};
+    if (ca["schema:telephone"]) phones.push(ca["schema:telephone"]);
+    if (ca["schema:email"])     emails.push(ca["schema:email"]);
+    if (ca["schema:url"])       websites.push(ca["schema:url"]);
+  }
+  // Also check direct attributes (older TV API format)
+  if (!phones.length && attr["schema:telephone"]) phones.push(attr["schema:telephone"]);
+  if (!emails.length && attr["schema:email"])     emails.push(attr["schema:email"]);
+  if (!websites.length && attr["schema:url"])     websites.push(attr["schema:url"]);
+
   const cleanPhone = (p) => p?.replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32") || "";
   const phone = phones[0] ? cleanPhone(phones[0]) : "";
   const phoneNorm = phone.replace(/[^0-9+]/g, "");
 
   // Images
-  const mediaRefs = rel.media?.data || [];
-  const images = mediaRefs
-    .map((m) => getIncluded(m.type, m.id)?.attributes?.contentUrl)
+  const mediaRefs = rel.media?.data || rel["main-media"]?.data ? [rel["main-media"]?.data].filter(Boolean) : [];
+  const allMediaRefs = (rel.media?.data || []).concat(mediaRefs).filter(Boolean);
+  const images = allMediaRefs
+    .map((m) => included.find(i => i.type === m.type && i.id === m.id)?.attributes?.contentUrl)
     .filter(Boolean)
     .slice(0, 5);
 
-  // Tourist region
-  let toeristischeRegio = "";
-  const regioRef = rel["tourist-region"]?.data || rel["touristRegion"]?.data || rel["toeristische-regio"]?.data;
-  if (regioRef) {
-    const regio = Array.isArray(regioRef)
-      ? getIncluded(regioRef[0]?.type, regioRef[0]?.id)
-      : getIncluded(regioRef.type, regioRef.id);
-    toeristischeRegio = regio?.attributes?.name || regio?.attributes?.["schema:name"] || "";
-  }
-  // Also check attributes directly
-  if (!toeristischeRegio) {
-    toeristischeRegio = attr["tourist-region"] || attr.touristRegion || attr["toeristische-regio"] || "";
-  }
+  // Slaapplaatsen
+  const slaapplaatsen = parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0);
 
-  // Accommodation type
-  const type = attr["dcterms:type"] || attr["schema:additionalType"] || attr.type || "";
+  // Status
+  const status = attr["registration-status"] || attr.status || "";
+
+  // Type
+  const type = attr["category"] || attr["dcterms:type"] || attr["schema:additionalType"] || attr.type || "";
+
+  // Date online
+  const dateOnline = attr["modified"] || attr["registration-date"] || attr["dcterms:created"] || "";
 
   return {
     id: raw.id,
-    name: attr["schema:name"] || attr.name || `Pand ${raw.id.slice(-6)}`,
+    name,
     municipality,
     province,
     toeristischeRegio,
     type,
-    postalCode: attr["postcode"] || attr["schema:address"]?.["schema:postalCode"] || "",
-    street: attr["schema:address"]?.["schema:streetAddress"] || "",
-    slaapplaatsen: attr["schema:numberOfRooms"] || attr.numberOfSleepingPlaces || 0,
+    postalCode,
+    street: attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || "",
+    slaapplaatsen,
     phone,
     phoneNorm,
     email: emails[0] || "",
     website: websites[0] || "",
     images,
-    status: attr.registrationStatus || attr.status || "",
-    dateOnline: attr["dcterms:created"] || attr["schema:dateCreated"] || attr.created || attr.dateCreated || "",
+    status,
+    dateOnline,
   };
 }
 
