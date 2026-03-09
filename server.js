@@ -106,10 +106,61 @@ const DB_SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_enrichment_age ON enrichment(enriched_at);
-`;
 
-app.use(cors({ origin: FRONTEND_URL }));
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name TEXT,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    name TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+\`;
+
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: "2mb" }));
+
+// ── AUTH HELPERS ──────────────────────────────────────────────────────────────
+const crypto = require("crypto");
+
+function hashPassword(password) {
+  return crypto.createHash("sha256").update(password + "yourdomi_salt_2025").digest("hex");
+}
+
+function generateToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function requireAuth(req, res, next) {
+  const token = req.headers["x-auth-token"];
+  if (!token) return res.status(401).json({ error: "Niet ingelogd" });
+  const session = db.prepare("SELECT * FROM sessions WHERE token = ? AND expires_at > ?").get(token, Date.now());
+  if (!session) return res.status(401).json({ error: "Sessie verlopen" });
+  req.user = { id: session.user_id, username: session.username, name: session.name };
+  next();
+}
+
+function ensureDefaultUsers() {
+  const count = db.prepare("SELECT COUNT(*) as c FROM users").get().c;
+  if (count === 0) {
+    const now = Date.now();
+    db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)").run(
+      "aaron", hashPassword("yourdomi2025"), "Aaron", now
+    );
+    db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)").run(
+      "ruben", hashPassword("yourdomi2025"), "Ruben", now
+    );
+    console.log("[auth] Default users created: aaron / ruben (password: yourdomi2025)");
+  }
+}
 
 // ── TOERISME VLAANDEREN FETCH ─────────────────────────────────────────────────
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
@@ -262,7 +313,7 @@ function parseLodging(raw, included = []) {
 // ── API ROUTES ────────────────────────────────────────────────────────────────
 
 // GET /api/panden?page=1&size=50&zoek=...&gemeente=...&provincie=...&status=...&minSlaap=...&maxSlaap=...&heeftTelefoon=...&heeftEmail=...&heeftWebsite=...
-app.get("/api/panden", (req, res) => {
+app.get("/api/panden", requireAuth, (req, res) => {
   const page = parseInt(req.query.page || "1");
   const size = Math.min(parseInt(req.query.size || "50"), 200);
 
@@ -309,7 +360,7 @@ app.get("/api/panden", (req, res) => {
 });
 
 // GET /api/panden/count
-app.get("/api/panden/count", (req, res) => {
+app.get("/api/panden/count", requireAuth, (req, res) => {
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
   res.json({ total, lastFetch });
@@ -333,7 +384,7 @@ app.get("/api/enrichment/:id", (req, res) => {
 });
 
 // GET /api/enrichment — get all (for bulk load)
-app.get("/api/enrichment", (req, res) => {
+app.get("/api/enrichment", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT id, data, enriched_at FROM enrichment").all();
   const result = {};
   for (const row of rows) {
@@ -343,7 +394,7 @@ app.get("/api/enrichment", (req, res) => {
 });
 
 // POST /api/enrichment/:id — save enrichment result
-app.post("/api/enrichment/:id", (req, res) => {
+app.post("/api/enrichment/:id", requireAuth, (req, res) => {
   const data = req.body;
   if (!data || typeof data !== "object") return res.status(400).json({ error: "Invalid data" });
   db.prepare("INSERT OR REPLACE INTO enrichment (id, data, enriched_at) VALUES (?, ?, ?)").run(
@@ -367,7 +418,7 @@ app.get("/api/enrichment/stale", (req, res) => {
 });
 
 // GET /api/outcomes — all outcomes + notes
-app.get("/api/outcomes", (req, res) => {
+app.get("/api/outcomes", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT * FROM outcomes").all();
   const result = {};
   for (const row of rows) {
@@ -382,7 +433,7 @@ app.get("/api/outcomes", (req, res) => {
 });
 
 // POST /api/outcomes/:id
-app.post("/api/outcomes/:id", (req, res) => {
+app.post("/api/outcomes/:id", requireAuth, (req, res) => {
   const { outcome, note, contactNaam } = req.body;
   db.prepare(
     "INSERT OR REPLACE INTO outcomes (id, outcome, note, contact_naam, updated_at) VALUES (?, ?, ?, ?, ?)"
@@ -391,7 +442,7 @@ app.post("/api/outcomes/:id", (req, res) => {
 });
 
 // GET /api/health
-app.get("/api/health", (req, res) => {
+app.get("/api/health", requireAuth, (req, res) => {
   const propCount = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const enrichCount = db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c;
   const outcomeCount = db.prepare("SELECT COUNT(*) as c FROM outcomes").get().c;
@@ -407,7 +458,7 @@ app.get("/api/health", (req, res) => {
 });
 
 // GET /api/meta - unique provinces, types for filter dropdowns
-app.get("/api/meta", (req, res) => {
+app.get("/api/meta", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT data FROM properties").all();
   const provinces = new Set();
   const types = new Set();
@@ -433,6 +484,65 @@ app.get("/api/meta", (req, res) => {
 cron.schedule("0 3 * * 0", () => {
   console.log("[cron] Weekly property sync starting...");
   syncPropertiesFromTV().catch(console.error);
+});
+
+// ── AUTH ENDPOINTS ───────────────────────────────────────────────────────────
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Gebruikersnaam en wachtwoord vereist" });
+  const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username.toLowerCase().trim());
+  if (!user || user.password_hash !== hashPassword(password)) {
+    return res.status(401).json({ error: "Ongeldige gebruikersnaam of wachtwoord" });
+  }
+  const token = generateToken();
+  const now = Date.now();
+  const expires = now + 30 * 24 * 60 * 60 * 1000; // 30 days
+  db.prepare("INSERT INTO sessions (token, user_id, username, name, created_at, expires_at) VALUES (?,?,?,?,?,?)").run(
+    token, user.id, user.username, user.name || user.username, now, expires
+  );
+  res.json({ token, username: user.username, name: user.name || user.username });
+});
+
+app.post("/api/logout", (req, res) => {
+  const token = req.headers["x-auth-token"];
+  if (token) db.prepare("DELETE FROM sessions WHERE token = ?").run(token);
+  res.json({ ok: true });
+});
+
+app.get("/api/me", requireAuth, (req, res) => {
+  res.json({ username: req.user.username, name: req.user.name });
+});
+
+app.get("/api/users", requireAuth, (req, res) => {
+  const users = db.prepare("SELECT id, username, name, created_at FROM users").all();
+  res.json(users);
+});
+
+app.post("/api/users", requireAuth, (req, res) => {
+  const { username, password, name } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "username en password vereist" });
+  try {
+    db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?,?,?,?)").run(
+      username.toLowerCase().trim(), hashPassword(password), name || username, Date.now()
+    );
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(400).json({ error: "Gebruikersnaam bestaat al" });
+  }
+});
+
+app.delete("/api/users/:username", requireAuth, (req, res) => {
+  db.prepare("DELETE FROM users WHERE username = ?").run(req.params.username);
+  res.json({ ok: true });
+});
+
+app.post("/api/users/:username/password", requireAuth, (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: "password vereist" });
+  db.prepare("UPDATE users SET password_hash = ? WHERE username = ?").run(
+    hashPassword(password), req.params.username
+  );
+  res.json({ ok: true });
 });
 
 // ── MONDAY PROXY ─────────────────────────────────────────────────────────────
@@ -463,6 +573,7 @@ async function startServer() {
   db = new Database(sqlDb);
   db.exec(DB_SCHEMA);
 
+  ensureDefaultUsers();
   app.listen(PORT, () => {
     console.log(`YourDomi server running on port ${PORT}`);
     console.log(`DB: ${DB_PATH}`);
