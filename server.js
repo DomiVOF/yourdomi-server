@@ -332,6 +332,7 @@ function parseLodging(raw, included = []) {
     website: websites[0] || "",
     images,
     status: attr.registrationStatus || attr.status || "",
+    dateOnline: attr["dcterms:created"] || attr["schema:dateCreated"] || attr.created || attr.dateCreated || "",
   };
 }
 
@@ -375,6 +376,12 @@ app.get("/api/panden", requireAuth, (req, res) => {
   if (heeftWebsite === "1") properties = properties.filter(p => !!p.website);
 
   const filteredTotal = properties.length;
+
+  // Sorting
+  if (req.query.sorteer === "nieuwste") {
+    properties.sort((a, b) => (b.dateOnline || "").localeCompare(a.dateOnline || ""));
+  }
+
   const offset = (page - 1) * size;
   const paged = properties.slice(offset, offset + size);
 
