@@ -89,7 +89,6 @@ try {
 
 function lookupMunicipality(name, uri) {
   // Primary: match by registration number extracted from URI
-  // TV API URI: https://linked.toerismevlaanderen.be/id/lodgings/211202-...
   if (uri) {
     const m = uri.match(/\/lodgings\/(\d+)/);
     if (m) {
@@ -333,10 +332,12 @@ function parseLodging(raw, included = []) {
 
   const luEntry = lookupMunicipality(name, uri);
   if (luEntry) {
-    municipality     = luEntry[0] || "";
-    province         = luEntry[1] || "";
-    postalCode       = luEntry[2] || "";
-    toeristischeRegio = luEntry[3] || "";
+    // luEntry: [name, municipality, province, postalCode, regio]
+    if (!name || name.startsWith("Pand ")) name = luEntry[0] || name; // use Excel name if TV API name empty
+    municipality      = luEntry[1] || "";
+    province          = luEntry[2] || "";
+    postalCode        = luEntry[3] || "";
+    toeristischeRegio = luEntry[4] || "";
   }
 
   // Fallback: try included (works when individual property is fetched)
