@@ -75,8 +75,14 @@ const path = require("path");
 let MUNI_LOOKUP = { by_name: {}, by_regnr: {} };
 try {
   const muniPath = path.join(__dirname, "municipalities.json");
-  MUNI_LOOKUP = JSON.parse(require("fs").readFileSync(muniPath, "utf-8"));
-  console.log(`[municipalities] Loaded ${Object.keys(MUNI_LOOKUP.by_name).length} name entries, ${Object.keys(MUNI_LOOKUP.by_regnr).length} regnr entries`);
+  const raw = JSON.parse(require("fs").readFileSync(muniPath, "utf-8"));
+  // Support both old flat format and new {by_name, by_regnr} format
+  if (raw.by_name) {
+    MUNI_LOOKUP = raw;
+  } else {
+    MUNI_LOOKUP = { by_name: raw, by_regnr: {} };
+  }
+  console.log(`[municipalities] Loaded ${Object.keys(MUNI_LOOKUP.by_name).length} name + ${Object.keys(MUNI_LOOKUP.by_regnr).length} regnr entries`);
 } catch(e) {
   console.warn("[municipalities] Could not load municipalities.json:", e.message);
 }
@@ -452,9 +458,14 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
 
     const properties = rows.map(r => {
-      const stored = JSON.parse(r.data);
-      return parseLodging(stored.raw || stored, stored.included || []);
-    });
+      try {
+        const stored = JSON.parse(r.data);
+        return parseLodging(stored.raw || stored, stored.included || []);
+      } catch(e) {
+        console.error("[panden] parseLodging error:", e.message);
+        return null;
+      }
+    }).filter(Boolean);
 
     res.json({
       data: properties,
