@@ -127,11 +127,16 @@ const DB_SCHEMA = `
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Always allow - reflect the request origin back (required for credentials)
-    callback(null, origin || "*");
+    // Always reflect the request origin back (required for credentials: true)
+    callback(null, origin || "https://yourdomi-bellist.vercel.app");
   },
-  credentials: true
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-auth-token", "Authorization"],
 }));
+
+// Handle preflight OPTIONS requests explicitly
+app.options("*", cors());
 app.use(express.json({ limit: "2mb" }));
 
 // -- AUTH HELPERS --------------------------------------------------------------
@@ -577,9 +582,11 @@ app.post("/api/users/:username/password", requireAuth, (req, res) => {
 
 // -- MONDAY PROXY -------------------------------------------------------------
 // Browser can't call Monday API directly (CORS). Proxy it through the server.
-app.post("/api/monday", async (req, res) => {
-  const { apiKey, query, variables } = req.body;
-  if (!apiKey || !query) return res.status(400).json({ error: "apiKey and query required" });
+app.post("/api/monday", requireAuth, async (req, res) => {
+  const apiKey = process.env.MONDAY_API_KEY;
+  const { query, variables } = req.body;
+  if (!apiKey) return res.status(500).json({ error: "MONDAY_API_KEY not configured on server" });
+  if (!query) return res.status(400).json({ error: "query required" });
   try {
     const r = await fetch("https://api.monday.com/v2", {
       method: "POST",
