@@ -127,13 +127,8 @@ const DB_SCHEMA = `
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    // If FRONTEND_URL is *, allow any origin
-    if (FRONTEND_URL === "*") return callback(null, origin);
-    // Otherwise check against configured URL
-    if (origin === FRONTEND_URL) return callback(null, true);
-    return callback(new Error("Not allowed by CORS"));
+    // Always allow - reflect the request origin back (required for credentials)
+    callback(null, origin || "*");
   },
   credentials: true
 }));
