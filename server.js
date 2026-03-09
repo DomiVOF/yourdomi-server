@@ -223,11 +223,30 @@ function parseLodging(raw, included = []) {
     .filter(Boolean)
     .slice(0, 5);
 
+  // Tourist region
+  let toeristischeRegio = "";
+  const regioRef = rel["tourist-region"]?.data || rel["touristRegion"]?.data || rel["toeristische-regio"]?.data;
+  if (regioRef) {
+    const regio = Array.isArray(regioRef)
+      ? getIncluded(regioRef[0]?.type, regioRef[0]?.id)
+      : getIncluded(regioRef.type, regioRef.id);
+    toeristischeRegio = regio?.attributes?.name || regio?.attributes?.["schema:name"] || "";
+  }
+  // Also check attributes directly
+  if (!toeristischeRegio) {
+    toeristischeRegio = attr["tourist-region"] || attr.touristRegion || attr["toeristische-regio"] || "";
+  }
+
+  // Accommodation type
+  const type = attr["dcterms:type"] || attr["schema:additionalType"] || attr.type || "";
+
   return {
     id: raw.id,
     name: attr["schema:name"] || attr.name || `Pand ${raw.id.slice(-6)}`,
     municipality,
     province,
+    toeristischeRegio,
+    type,
     postalCode: attr["schema:address"]?.["schema:postalCode"] || "",
     street: attr["schema:address"]?.["schema:streetAddress"] || "",
     slaapplaatsen: attr["schema:numberOfRooms"] || attr.numberOfSleepingPlaces || 0,
@@ -237,7 +256,6 @@ function parseLodging(raw, included = []) {
     website: websites[0] || "",
     images,
     status: attr.registrationStatus || attr.status || "",
-    type: attr["dcterms:type"] || "",
   };
 }
 
@@ -275,6 +293,7 @@ app.get("/api/panden", (req, res) => {
   if (minSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) >= parseInt(minSlaap));
   if (maxSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) <= parseInt(maxSlaap));
   if (req.query.type) properties = properties.filter(p => p.type === req.query.type);
+  if (req.query.regio) properties = properties.filter(p => p.toeristischeRegio === req.query.regio);
   if (heeftTelefoon === "1") properties = properties.filter(p => !!p.phone);
   if (heeftEmail === "1") properties = properties.filter(p => !!p.email);
   if (heeftWebsite === "1") properties = properties.filter(p => !!p.website);
@@ -392,17 +411,20 @@ app.get("/api/meta", (req, res) => {
   const rows = db.prepare("SELECT data FROM properties").all();
   const provinces = new Set();
   const types = new Set();
+  const regios = new Set();
   for (const r of rows) {
     try {
       const p = JSON.parse(r.data);
       const parsed = parseLodging(p.raw || p, p.included || []);
       if (parsed.province) provinces.add(parsed.province);
       if (parsed.type) types.add(parsed.type);
+      if (parsed.toeristischeRegio) regios.add(parsed.toeristischeRegio);
     } catch {}
   }
   res.json({
     provinces: [...provinces].sort(),
     types: [...types].sort(),
+    regios: [...regios].sort(),
   });
 });
 
@@ -411,6 +433,28 @@ app.get("/api/meta", (req, res) => {
 cron.schedule("0 3 * * 0", () => {
   console.log("[cron] Weekly property sync starting...");
   syncPropertiesFromTV().catch(console.error);
+});
+
+// ── MONDAY PROXY ─────────────────────────────────────────────────────────────
+// Browser can't call Monday API directly (CORS). Proxy it through the server.
+app.post("/api/monday", async (req, res) => {
+  const { apiKey, query, variables } = req.body;
+  if (!apiKey || !query) return res.status(400).json({ error: "apiKey and query required" });
+  try {
+    const r = await fetch("https://api.monday.com/v2", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": apiKey,
+        "API-Version": "2024-01",
+      },
+      body: JSON.stringify({ query, variables: variables || {} }),
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
