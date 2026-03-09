@@ -301,7 +301,7 @@ function parseLodging(raw, included = []) {
     }
   }
   // Fallbacks from attributes
-  if (!municipality) municipality = attr["schema:address"]?.["schema:addressLocality"] || attr["municipality"] || attr["address-municipality"] || "";
+  if (!municipality) municipality = attr["municipality-name"] || attr["schema:address"]?.["schema:addressLocality"] || attr["municipality"] || attr["address-municipality"] || attr["postal-info"] || "";
   if (!province) province = attr["schema:address"]?.["schema:addressRegion"] || attr["province"] || "";
 
   // Contact
@@ -381,7 +381,17 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const q = `%${zoek.toLowerCase()}%`;
     params.push(q, q, `%${zoek}%`);
   }
-  if (gemeente) { conditions.push("LOWER(municipality) LIKE ?"); params.push(`%${gemeente.toLowerCase()}%`); }
+  if (gemeente) {
+    const g = `%${gemeente.toLowerCase()}%`;
+    conditions.push(`(
+      LOWER(municipality) LIKE ?
+      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["municipality-name"]')) LIKE ?
+      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["schema:address"]["schema:addressLocality"]')) LIKE ?
+      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["address-municipality"]')) LIKE ?
+      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["postal-info"]')) LIKE ?
+    )`);
+    params.push(g, g, g, g, g);
+  }
   if (provincie) { conditions.push("province = ?"); params.push(provincie); }
   if (status) { conditions.push("status = ?"); params.push(status); }
   if (minSlaap) { conditions.push("slaapplaatsen >= ?"); params.push(parseInt(minSlaap)); }
@@ -686,13 +696,14 @@ async function startServer() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status)`);
   // Backfill any rows with empty municipality (existing data)
-  const unfilled = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
+  // Force re-backfill all rows (municipality field names were corrected)
+  const unfilled = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   if (unfilled > 0) {
     console.log(`[migration] Will backfill ${unfilled} rows in background...`);
     setTimeout(() => {
       console.log("[migration] Starting backfill...");
       try {
-        const rows = db.prepare("SELECT id, data FROM properties WHERE municipality IS NULL OR municipality = ''").all();
+        const rows = db.prepare("SELECT id, data FROM properties").all();
         const upd = db.prepare("UPDATE properties SET municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=? WHERE id=?");
         let count = 0;
         for (const row of rows) {
