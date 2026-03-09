@@ -429,26 +429,45 @@ app.get("/api/panden/count", requireAuth, (req, res) => {
   res.json({ total, lastFetch });
 });
 
-// GET /api/debug/municipality — check what's stored (remove after testing)
-app.get("/api/debug/municipality", requireAuth, (req, res) => {
-  const sample = db.prepare("SELECT id, name, municipality, province, postal_code FROM properties LIMIT 20").all();
-  const emptyCount = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
-  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+// GET /api/debug — NO AUTH — shows raw stored data so we can fix field names
+app.get("/api/debug", (req, res) => {
+  try {
+    const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+    const emptyMuni = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
+    const filledMuni = total - emptyMuni;
 
-  // Dump raw attributes of first 3 stored properties so we can see exact field names
-  const rawSample = db.prepare("SELECT data FROM properties LIMIT 3").all().map(r => {
-    const stored = JSON.parse(r.data);
-    const raw = stored.raw || stored;
-    return {
-      id: raw.id,
-      attributes: raw.attributes || {},
-      relationshipKeys: Object.keys(raw.relationships || {}),
-      includedTypes: (stored.included || []).map(i => i.type),
-      includedCount: (stored.included || []).length,
-    };
-  });
+    // Show raw attributes of first 3 properties — this tells us the exact TV API field names
+    const rawRows = db.prepare("SELECT data FROM properties LIMIT 3").all();
+    const rawSamples = rawRows.map(r => {
+      const stored = JSON.parse(r.data);
+      const raw = stored.raw || stored;
+      const attr = raw.attributes || {};
+      return {
+        id: raw.id,
+        allAttributeKeys: Object.keys(attr),
+        schemaAddress: attr["schema:address"] || null,
+        relationshipKeys: Object.keys(raw.relationships || {}),
+        includedCount: (stored.included || []).length,
+        includedTypes: [...new Set((stored.included || []).map(i => i.type))],
+        firstIncluded: (stored.included || [])[0] || null,
+        // Show all values for key candidates
+        "attr.hoofdgemeente": attr["hoofdgemeente"],
+        "attr.municipality-name": attr["municipality-name"],
+        "attr.address-municipality": attr["address-municipality"],
+        "attr.schema:address": attr["schema:address"],
+        "rel.municipality": raw.relationships?.municipality || null,
+      };
+    });
 
-  res.json({ total, emptyMunicipality: emptyCount, sample, rawSample });
+    // Also test: does gemeente filter return anything?
+    const testGent = db.prepare("SELECT COUNT(*) as c FROM properties WHERE LOWER(municipality) LIKE '%gent%'").get().c;
+    const testKoksijde = db.prepare("SELECT COUNT(*) as c FROM properties WHERE LOWER(municipality) LIKE '%koksijde%'").get().c;
+    const sampleMunicipalities = db.prepare("SELECT municipality, COUNT(*) as c FROM properties WHERE municipality != '' GROUP BY municipality ORDER BY c DESC LIMIT 20").all();
+
+    res.json({ total, filledMuni, emptyMuni, testGent, testKoksijde, sampleMunicipalities, rawSamples });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST or GET /api/sync - trigger manual sync
