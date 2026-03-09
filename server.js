@@ -125,7 +125,18 @@ const DB_SCHEMA = `
   );
 `;
 
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    // If FRONTEND_URL is *, allow any origin
+    if (FRONTEND_URL === "*") return callback(null, origin);
+    // Otherwise check against configured URL
+    if (origin === FRONTEND_URL) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: "2mb" }));
 
 // -- AUTH HELPERS --------------------------------------------------------------
@@ -149,16 +160,25 @@ function requireAuth(req, res, next) {
 }
 
 function ensureDefaultUsers() {
-  const count = db.prepare("SELECT COUNT(*) as c FROM users").get().c;
-  if (count === 0) {
-    const now = Date.now();
-    db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)").run(
-      "aaron", hashPassword("yourdomi2025"), "Aaron", now
-    );
-    db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)").run(
-      "ruben", hashPassword("yourdomi2025"), "Ruben", now
-    );
-    console.log("[auth] Default users created: aaron / ruben (password: yourdomi2025)");
+  const now = Date.now();
+  const defaults = [
+    { username: "aaron", name: "Aaron" },
+    { username: "ruben", name: "Ruben" },
+    { username: "vic",   name: "Vic"   },
+  ];
+  for (const u of defaults) {
+    const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(u.username);
+    if (!existing) {
+      db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)").run(
+        u.username, hashPassword("yourdomi2026"), u.name, now
+      );
+      console.log(`[auth] Created user: ${u.username}`);
+    } else {
+      db.prepare("UPDATE users SET password_hash = ?, name = ? WHERE username = ?").run(
+        hashPassword("yourdomi2026"), u.name, u.username
+      );
+      console.log(`[auth] Updated user: ${u.username}`);
+    }
   }
 }
 
