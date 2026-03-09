@@ -71,20 +71,33 @@ const cron = require("node-cron");
 const path = require("path");
 
 // Load municipality lookup from Excel-derived JSON
-// Format: { "name lowercase": [municipality, province, postalCode, regio] }
-let MUNI_LOOKUP = {};
+// Format: { by_name: { "name lowercase": [...] }, by_regnr: { "211202": [...] } }
+let MUNI_LOOKUP = { by_name: {}, by_regnr: {} };
 try {
   const muniPath = path.join(__dirname, "municipalities.json");
   MUNI_LOOKUP = JSON.parse(require("fs").readFileSync(muniPath, "utf-8"));
-  console.log(`[municipalities] Loaded ${Object.keys(MUNI_LOOKUP).length} entries`);
+  console.log(`[municipalities] Loaded ${Object.keys(MUNI_LOOKUP.by_name).length} name entries, ${Object.keys(MUNI_LOOKUP.by_regnr).length} regnr entries`);
 } catch(e) {
   console.warn("[municipalities] Could not load municipalities.json:", e.message);
 }
 
-function lookupMunicipality(name) {
-  if (!name) return null;
-  const key = name.toLowerCase().trim();
-  return MUNI_LOOKUP[key] || null; // returns [municipality, province, postalCode, regio] or null
+function lookupMunicipality(name, uri) {
+  // Primary: match by registration number extracted from URI
+  // TV API URI: https://linked.toerismevlaanderen.be/id/lodgings/211202-...
+  if (uri) {
+    const m = uri.match(/\/lodgings\/(\d+)/);
+    if (m) {
+      const entry = MUNI_LOOKUP.by_regnr[m[1]];
+      if (entry) return entry;
+    }
+  }
+  // Fallback: match by normalized name
+  if (name) {
+    const key = name.toLowerCase().trim().replace(/^['\"\s]+|['\"\s]+$/g, "").replace(/\s+/g, " ");
+    const entry = MUNI_LOOKUP.by_name[key];
+    if (entry) return entry;
+  }
+  return null;
 }
 
 const app = express();
@@ -308,13 +321,11 @@ function parseLodging(raw, included = []) {
   // Name — this is what we match against the Excel lookup
   const name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
 
-  // Municipality — use Excel lookup as PRIMARY source (TV API list endpoint has no included data)
-  let municipality = "";
-  let province = "";
-  let postalCode = "";
-  let toeristischeRegio = "";
+  // Municipality — use Excel lookup: primary by registration number (from URI), fallback by name
+  const uri = attr["uri"] || attr["@id"] || "";
+  let municipality = "", province = "", postalCode = "", toeristischeRegio = "";
 
-  const luEntry = lookupMunicipality(name); // [municipality, province, postalCode, regio]
+  const luEntry = lookupMunicipality(name, uri);
   if (luEntry) {
     municipality     = luEntry[0] || "";
     province         = luEntry[1] || "";
