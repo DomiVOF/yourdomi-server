@@ -125,18 +125,17 @@ const DB_SCHEMA = `
   );
 `;
 
-app.use(cors({
+const corsOptions = {
   origin: function(origin, callback) {
-    // Always reflect the request origin back (required for credentials: true)
     callback(null, origin || "https://yourdomi-bellist.vercel.app");
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "x-auth-token", "Authorization"],
-}));
-
-// Handle preflight OPTIONS requests explicitly
-app.options("*", cors());
+  optionsSuccessStatus: 204,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // handle all preflight requests
 app.use(express.json({ limit: "2mb" }));
 
 // -- AUTH HELPERS --------------------------------------------------------------
