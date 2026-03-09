@@ -249,7 +249,7 @@ async function syncPropertiesFromTV() {
       const pct = Math.round(synced / total * 100);
       console.log(`[sync] Pages ${batch[0]}-${batch[batch.length-1]}: ${synced}/${total} (${pct}%)`);
 
-      await new Promise(r => setTimeout(r, 50)); // small pause between batches
+      await new Promise(r => setTimeout(r, 100)); // yield event loop between batches
     }
 
     console.log(`[sync] Done. Synced ${synced} properties.`);
