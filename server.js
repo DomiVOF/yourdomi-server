@@ -184,25 +184,21 @@ function ensureDefaultUsers() {
 
 // -- TOERISME VLAANDEREN FETCH -------------------------------------------------
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
-const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
 
 async function fetchPageFromTV(page = 1, size = 100) {
-  // Fetch ALL lodgings - no type or status filter
   const url = `https://linked.toerismevlaanderen.be/lodgings?page[size]=${size}&page[number]=${page}`;
-  console.log(`[sync] Fetching page ${page}: ${url}`);
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) throw new Error(`TV API ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
 async function syncPropertiesFromTV() {
-  console.log("[sync] Starting property sync from Toerisme Vlaanderen...");
-  let page = 1;
-  let total = null;
-  let synced = 0;
+  console.log("[sync] Starting fast parallel sync from Toerisme Vlaanderen...");
+  const PAGE_SIZE = 100;
+  const CONCURRENCY = 8;  // parallel requests at once
   const now = Date.now();
 
   const insert = db.prepare(
@@ -215,37 +211,47 @@ async function syncPropertiesFromTV() {
   });
 
   try {
-    while (true) {
-      const data = await fetchPageFromTV(page, 50);
-      if (!total) {
-        total = data.meta?.count || data.meta?.total || 0;
-        console.log(`[sync] Total properties: ${total}`);
-        console.log(`[sync] Meta:`, JSON.stringify(data.meta || {}));
-        console.log(`[sync] Data length:`, (data.data || []).length);
-        if (total === 0) {
-          console.log(`[sync] Response keys:`, Object.keys(data).join(", "));
-          break;
+    // Step 1: fetch page 1 to get total count
+    const firstPage = await fetchPageFromTV(1, PAGE_SIZE);
+    const total = firstPage.meta?.count || firstPage.meta?.total || 0;
+    if (!total) { console.log("[sync] No properties found."); return; }
+    const totalPages = Math.ceil(total / PAGE_SIZE);
+    console.log(`[sync] Total: ${total} properties across ${totalPages} pages — ${CONCURRENCY} parallel`);
+
+    // Store first page
+    const firstItems = (firstPage.data || []).map(item => ({ id: item.id, raw: item, included: firstPage.included || [] }));
+    insertMany(firstItems);
+    let synced = firstItems.length;
+
+    // Step 2: remaining pages in parallel batches
+    const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
+
+    for (let i = 0; i < remainingPages.length; i += CONCURRENCY) {
+      const batch = remainingPages.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(p => fetchPageFromTV(p, PAGE_SIZE)));
+
+      const toStore = [];
+      for (let j = 0; j < results.length; j++) {
+        const r = results[j];
+        if (r.status === "fulfilled") {
+          (r.value.data || []).forEach(item => toStore.push({ id: item.id, raw: item, included: r.value.included || [] }));
+        } else {
+          console.warn(`[sync] Page ${batch[j]} failed: ${r.reason?.message} — retrying`);
+          try {
+            const retry = await fetchPageFromTV(batch[j], PAGE_SIZE);
+            (retry.data || []).forEach(item => toStore.push({ id: item.id, raw: item, included: retry.included || [] }));
+          } catch(e) { console.error(`[sync] Page ${batch[j]} retry failed: ${e.message}`); }
         }
       }
-      const items = data.data || [];
-      if (items.length === 0) break;
 
-      // Store raw items with included for later parsing
-      const toStore = items.map((item) => ({
-        id: item.id,
-        raw: item,
-        included: data.included || [],
-      }));
-      insertMany(toStore.map((i) => ({ id: i.id, ...i })));
-      synced += items.length;
+      insertMany(toStore);
+      synced += toStore.length;
+      const pct = Math.round(synced / total * 100);
+      console.log(`[sync] Pages ${batch[0]}-${batch[batch.length-1]}: ${synced}/${total} (${pct}%)`);
 
-      console.log(`[sync] Page ${page}: ${synced}/${total}`);
-
-      if (synced >= total) break;
-      page++;
-      // Small delay to be respectful to TV API
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 50)); // small pause between batches
     }
+
     console.log(`[sync] Done. Synced ${synced} properties.`);
   } catch (e) {
     console.error("[sync] Error:", e.message);
