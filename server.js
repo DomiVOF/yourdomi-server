@@ -434,7 +434,21 @@ app.get("/api/debug/municipality", requireAuth, (req, res) => {
   const sample = db.prepare("SELECT id, name, municipality, province, postal_code FROM properties LIMIT 20").all();
   const emptyCount = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
-  res.json({ total, emptyMunicipality: emptyCount, sample });
+
+  // Dump raw attributes of first 3 stored properties so we can see exact field names
+  const rawSample = db.prepare("SELECT data FROM properties LIMIT 3").all().map(r => {
+    const stored = JSON.parse(r.data);
+    const raw = stored.raw || stored;
+    return {
+      id: raw.id,
+      attributes: raw.attributes || {},
+      relationshipKeys: Object.keys(raw.relationships || {}),
+      includedTypes: (stored.included || []).map(i => i.type),
+      includedCount: (stored.included || []).length,
+    };
+  });
+
+  res.json({ total, emptyMunicipality: emptyCount, sample, rawSample });
 });
 
 // POST or GET /api/sync - trigger manual sync
