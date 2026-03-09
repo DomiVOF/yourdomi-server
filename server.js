@@ -34,7 +34,6 @@ class Statement {
   constructor(db, sql) { this.db = db; this.sql = sql; }
   run(...args) {
     this.db.run(this.sql, args.flat());
-    saveDb();
     return { changes: 1 };
   }
   get(...args) {
@@ -98,9 +97,6 @@ const DB_SCHEMA = `
     regio TEXT,
     date_online TEXT
   );
-  CREATE INDEX IF NOT EXISTS idx_props_municipality ON properties(municipality);
-  CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province);
-  CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status);
 
   CREATE TABLE IF NOT EXISTS enrichment (
     id TEXT PRIMARY KEY,
@@ -685,23 +681,32 @@ async function startServer() {
       console.log(`[migration] Added column: ${col}`);
     }
   }
+  // Create indexes now that columns are guaranteed to exist
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_props_municipality ON properties(municipality)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status)`);
   // Backfill any rows with empty municipality (existing data)
   const unfilled = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
   if (unfilled > 0) {
-    console.log(`[migration] Backfilling ${unfilled} rows with parsed fields...`);
-    const rows = db.prepare("SELECT id, data FROM properties WHERE municipality IS NULL OR municipality = ''").all();
-    const upd = db.prepare("UPDATE properties SET municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=? WHERE id=?");
-    const backfill = db.transaction(() => {
-      for (const row of rows) {
-        try {
-          const stored = JSON.parse(row.data);
-          const p = parseLodging(stored.raw || stored, stored.included || []);
-          upd.run(p.municipality||"", p.province||"", p.status||"", p.slaapplaatsen||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", row.id);
-        } catch(e) {}
-      }
-    });
-    backfill();
-    console.log("[migration] Backfill complete");
+    console.log(`[migration] Will backfill ${unfilled} rows in background...`);
+    setTimeout(() => {
+      console.log("[migration] Starting backfill...");
+      try {
+        const rows = db.prepare("SELECT id, data FROM properties WHERE municipality IS NULL OR municipality = ''").all();
+        const upd = db.prepare("UPDATE properties SET municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=? WHERE id=?");
+        let count = 0;
+        for (const row of rows) {
+          try {
+            const stored = JSON.parse(row.data);
+            const p = parseLodging(stored.raw || stored, stored.included || []);
+            upd.run(p.municipality||"", p.province||"", p.status||"", p.slaapplaatsen||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", row.id);
+            count++;
+          } catch(e) {}
+        }
+        saveDb();
+        console.log(`[migration] Backfill complete: ${count} rows`);
+      } catch(e) { console.error("[migration] Backfill error:", e.message); }
+    }, 3000); // wait 3s after server starts
   }
 
   ensureDefaultUsers();
