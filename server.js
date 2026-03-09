@@ -41,14 +41,7 @@ class Statement {
     const stmt = this.db.prepare(this.sql);
     const params = args.flat();
     if (params.length) stmt.bind(params);
-    const cols = stmt.getColumnNames();
-    let result = undefined;
-    if (stmt.step()) {
-      const row = stmt.get();
-      const obj = {};
-      cols.forEach((c, i) => { obj[c] = row[i]; });
-      result = obj;
-    }
+    const result = stmt.step() ? stmt.getAsObject() : undefined;
     stmt.free();
     return result;
   }
@@ -56,14 +49,8 @@ class Statement {
     const stmt = this.db.prepare(this.sql);
     const params = args.flat();
     if (params.length) stmt.bind(params);
-    const cols = stmt.getColumnNames();
     const results = [];
-    while (stmt.step()) {
-      const row = stmt.get();
-      const obj = {};
-      cols.forEach((c, i) => { obj[c] = row[i]; });
-      results.push(obj);
-    }
+    while (stmt.step()) results.push(stmt.getAsObject());
     stmt.free();
     return results;
   }
