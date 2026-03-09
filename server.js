@@ -79,7 +79,7 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "*";
 const AI_STALE_DAYS = parseInt(process.env.AI_STALE_DAYS || "100");
 
-// ── DATABASE ─────────────────────────────────────────────────────────────────
+// -- DATABASE -----------------------------------------------------------------
 const DB_PATH = process.env.DB_PATH || "/data/yourdomi.db";
 let db; // initialized async below
 
@@ -123,12 +123,12 @@ const DB_SCHEMA = `
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
-\`;
+`;
 
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: "2mb" }));
 
-// ── AUTH HELPERS ──────────────────────────────────────────────────────────────
+// -- AUTH HELPERS --------------------------------------------------------------
 const crypto = require("crypto");
 
 function hashPassword(password) {
@@ -162,7 +162,7 @@ function ensureDefaultUsers() {
   }
 }
 
-// ── TOERISME VLAANDEREN FETCH ─────────────────────────────────────────────────
+// -- TOERISME VLAANDEREN FETCH -------------------------------------------------
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 const TV_TYPE = "d2d28d1d-bd4e-4aac-86ae-6a70861a7a73"; // vakantiewoning
 
@@ -232,7 +232,7 @@ async function syncPropertiesFromTV() {
   }
 }
 
-// ── PARSE LODGING (same logic as frontend) ───────────────────────────────────
+// -- PARSE LODGING (same logic as frontend) -----------------------------------
 function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
@@ -310,7 +310,7 @@ function parseLodging(raw, included = []) {
   };
 }
 
-// ── API ROUTES ────────────────────────────────────────────────────────────────
+// -- API ROUTES ----------------------------------------------------------------
 
 // GET /api/panden?page=1&size=50&zoek=...&gemeente=...&provincie=...&status=...&minSlaap=...&maxSlaap=...&heeftTelefoon=...&heeftEmail=...&heeftWebsite=...
 app.get("/api/panden", requireAuth, (req, res) => {
@@ -366,7 +366,7 @@ app.get("/api/panden/count", requireAuth, (req, res) => {
   res.json({ total, lastFetch });
 });
 
-// POST or GET /api/sync — trigger manual sync
+// POST or GET /api/sync - trigger manual sync
 app.post("/api/sync", async (req, res) => {
   res.json({ ok: true, message: "Sync started in background" });
   syncPropertiesFromTV().catch(console.error);
@@ -383,7 +383,7 @@ app.get("/api/enrichment/:id", (req, res) => {
   res.json({ ...JSON.parse(row.data), _enrichedAt: row.enriched_at });
 });
 
-// GET /api/enrichment — get all (for bulk load)
+// GET /api/enrichment - get all (for bulk load)
 app.get("/api/enrichment", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT id, data, enriched_at FROM enrichment").all();
   const result = {};
@@ -393,7 +393,7 @@ app.get("/api/enrichment", requireAuth, (req, res) => {
   res.json(result);
 });
 
-// POST /api/enrichment/:id — save enrichment result
+// POST /api/enrichment/:id - save enrichment result
 app.post("/api/enrichment/:id", requireAuth, (req, res) => {
   const data = req.body;
   if (!data || typeof data !== "object") return res.status(400).json({ error: "Invalid data" });
@@ -405,7 +405,7 @@ app.post("/api/enrichment/:id", requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /api/enrichment/stale — get IDs that need re-enrichment
+// GET /api/enrichment/stale - get IDs that need re-enrichment
 app.get("/api/enrichment/stale", (req, res) => {
   const cutoff = Date.now() - AI_STALE_DAYS * 24 * 60 * 60 * 1000;
   // Properties with no enrichment or enrichment older than AI_STALE_DAYS
@@ -417,7 +417,7 @@ app.get("/api/enrichment/stale", (req, res) => {
   res.json({ stale: [...stale, ...unenriched].slice(0, 200) });
 });
 
-// GET /api/outcomes — all outcomes + notes
+// GET /api/outcomes - all outcomes + notes
 app.get("/api/outcomes", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT * FROM outcomes").all();
   const result = {};
@@ -479,15 +479,15 @@ app.get("/api/meta", requireAuth, (req, res) => {
   });
 });
 
-// ── CRON: weekly property sync, daily stale re-enrichment check ───────────────
-// Every Sunday at 03:00 — re-sync all properties from TV
+// -- CRON: weekly property sync, daily stale re-enrichment check ---------------
+// Every Sunday at 03:00 - re-sync all properties from TV
 cron.schedule("0 3 * * 0", () => {
   console.log("[cron] Weekly property sync starting...");
   syncPropertiesFromTV().catch(console.error);
 });
 
-// ── AUTH ENDPOINTS ───────────────────────────────────────────────────────────
-// Emergency reset — only works if ADMIN_PASSWORD env var is set in Railway
+// -- AUTH ENDPOINTS -----------------------------------------------------------
+// Emergency reset - only works if ADMIN_PASSWORD env var is set in Railway
 app.post("/api/admin/reset-password", (req, res) => {
   const adminPw = process.env.ADMIN_PASSWORD;
   if (!adminPw) return res.status(403).json({ error: "ADMIN_PASSWORD not configured" });
@@ -560,7 +560,7 @@ app.post("/api/users/:username/password", requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ── MONDAY PROXY ─────────────────────────────────────────────────────────────
+// -- MONDAY PROXY -------------------------------------------------------------
 // Browser can't call Monday API directly (CORS). Proxy it through the server.
 app.post("/api/monday", async (req, res) => {
   const { apiKey, query, variables } = req.body;
@@ -582,7 +582,7 @@ app.post("/api/monday", async (req, res) => {
   }
 });
 
-// ── START ─────────────────────────────────────────────────────────────────────
+// -- START ---------------------------------------------------------------------
 async function startServer() {
   const sqlDb = await initDb(DB_PATH);
   db = new Database(sqlDb);
@@ -596,7 +596,7 @@ async function startServer() {
 
     const count = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
     if (count === 0) {
-      console.log("[startup] Empty DB — starting initial TV sync...");
+      console.log("[startup] Empty DB - starting initial TV sync...");
       syncPropertiesFromTV().catch(console.error);
     } else {
       console.log(`[startup] DB has ${count} properties.`);
