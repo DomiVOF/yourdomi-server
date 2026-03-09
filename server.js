@@ -582,6 +582,26 @@ app.post("/api/users/:username/password", requireAuth, (req, res) => {
 
 // -- MONDAY PROXY -------------------------------------------------------------
 // Browser can't call Monday API directly (CORS). Proxy it through the server.
+app.post("/api/ai", requireAuth, async (req, res) => {
+  const apiKey = ANTHROPIC_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_KEY not configured on server" });
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(req.body),
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/monday", requireAuth, async (req, res) => {
   const apiKey = process.env.MONDAY_API_KEY;
   const { query, variables } = req.body;
