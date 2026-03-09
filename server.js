@@ -38,23 +38,34 @@ class Statement {
     return { changes: 1 };
   }
   get(...args) {
-    const res = this.db.exec(this.sql, args.flat());
-    if (!res.length || !res[0].values.length) return undefined;
-    const cols = res[0].columns;
-    const row = res[0].values[0];
-    const obj = {};
-    cols.forEach((c, i) => obj[c] = row[i]);
-    return obj;
+    const stmt = this.db.prepare(this.sql);
+    const params = args.flat();
+    if (params.length) stmt.bind(params);
+    const cols = stmt.getColumnNames();
+    let result = undefined;
+    if (stmt.step()) {
+      const row = stmt.get();
+      const obj = {};
+      cols.forEach((c, i) => { obj[c] = row[i]; });
+      result = obj;
+    }
+    stmt.free();
+    return result;
   }
   all(...args) {
-    const res = this.db.exec(this.sql, args.flat());
-    if (!res.length) return [];
-    const cols = res[0].columns;
-    return res[0].values.map(row => {
+    const stmt = this.db.prepare(this.sql);
+    const params = args.flat();
+    if (params.length) stmt.bind(params);
+    const cols = stmt.getColumnNames();
+    const results = [];
+    while (stmt.step()) {
+      const row = stmt.get();
       const obj = {};
-      cols.forEach((c, i) => obj[c] = row[i]);
-      return obj;
-    });
+      cols.forEach((c, i) => { obj[c] = row[i]; });
+      results.push(obj);
+    }
+    stmt.free();
+    return results;
   }
 }
 
