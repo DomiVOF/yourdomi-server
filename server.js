@@ -86,6 +86,7 @@ const DB_SCHEMA = `
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL,
     fetched_at INTEGER NOT NULL,
+    name TEXT,
     municipality TEXT,
     province TEXT,
     status TEXT,
@@ -95,7 +96,8 @@ const DB_SCHEMA = `
     website TEXT,
     type TEXT,
     regio TEXT,
-    date_online TEXT
+    date_online TEXT,
+    postal_code TEXT
   );
 
   CREATE TABLE IF NOT EXISTS enrichment (
@@ -208,7 +210,7 @@ async function syncPropertiesFromTV() {
   const now = Date.now();
 
   const insert = db.prepare(
-    "INSERT OR REPLACE INTO properties (id, data, fetched_at, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const insertMany = db.transaction((items) => {
     for (const item of items) {
@@ -217,6 +219,7 @@ async function syncPropertiesFromTV() {
         item.id,
         JSON.stringify(item),
         now,
+        parsed.name || "",
         parsed.municipality || "",
         parsed.province || "",
         parsed.status || "",
@@ -226,7 +229,8 @@ async function syncPropertiesFromTV() {
         parsed.website || "",
         parsed.type || "",
         parsed.toeristischeRegio || "",
-        parsed.dateOnline || ""
+        parsed.dateOnline || "",
+        parsed.postalCode || ""
       );
     }
   });
@@ -363,68 +367,74 @@ function parseLodging(raw, included = []) {
 
 // -- API ROUTES ----------------------------------------------------------------
 
-// GET /api/panden?page=1&size=50&zoek=...&gemeente=...&provincie=...&status=...&minSlaap=...&maxSlaap=...&heeftTelefoon=...&heeftEmail=...&heeftWebsite=...
+// GET /api/panden
 app.get("/api/panden", requireAuth, (req, res) => {
-  const page = parseInt(req.query.page || "1");
-  const size = Math.min(parseInt(req.query.size || "50"), 200);
-  const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
+  try {
+    const page = parseInt(req.query.page || "1");
+    const size = Math.min(parseInt(req.query.size || "50"), 200);
+    const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
 
-  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
-  if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
+    const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+    if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
 
-  // Build SQL WHERE clause from filters
-  const conditions = [];
-  const params = [];
+    // All filters use indexed columns only — no JSON_EXTRACT
+    const conditions = [];
+    const params = [];
 
-  if (zoek) {
-    conditions.push("(LOWER(JSON_EXTRACT(data, '$.raw.attributes[\"schema:name\"]')) LIKE ? OR LOWER(municipality) LIKE ? OR JSON_EXTRACT(data, '$.raw.attributes[\"schema:address\"][\"schema:postalCode\"]') LIKE ?)");
-    const q = `%${zoek.toLowerCase()}%`;
-    params.push(q, q, `%${zoek}%`);
+    if (zoek) {
+      const q = `%${zoek.toLowerCase()}%`;
+      conditions.push("(LOWER(name) LIKE ? OR LOWER(municipality) LIKE ? OR postal_code LIKE ?)");
+      params.push(q, q, `%${zoek}%`);
+    }
+    if (gemeente) {
+      conditions.push("LOWER(municipality) LIKE ?");
+      params.push(`%${gemeente.toLowerCase()}%`);
+    }
+    if (provincie) { conditions.push("province = ?"); params.push(provincie); }
+    if (status)    { conditions.push("status = ?");   params.push(status); }
+    if (minSlaap)  { conditions.push("slaapplaatsen >= ?"); params.push(parseInt(minSlaap)); }
+    if (maxSlaap)  { conditions.push("slaapplaatsen <= ?"); params.push(parseInt(maxSlaap)); }
+    if (req.query.type)  { conditions.push("type = ?");  params.push(req.query.type); }
+    if (req.query.regio) { conditions.push("regio = ?"); params.push(req.query.regio); }
+    if (heeftTelefoon === "1") { conditions.push("phone != '' AND phone IS NOT NULL"); }
+    if (heeftEmail    === "1") { conditions.push("email != '' AND email IS NOT NULL"); }
+    if (heeftWebsite  === "1") { conditions.push("website != '' AND website IS NOT NULL"); }
+
+    const where   = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+    const orderBy = req.query.sorteer === "nieuwste" ? "ORDER BY date_online DESC" : "";
+
+    const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
+    const offset = (page - 1) * size;
+    const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
+
+    const properties = rows.map(r => {
+      const stored = JSON.parse(r.data);
+      return parseLodging(stored.raw || stored, stored.included || []);
+    });
+
+    res.json({
+      data: properties,
+      meta: { total: filteredTotal, dbTotal: total, page, size, pages: Math.ceil(filteredTotal / size) },
+    });
+  } catch (e) {
+    console.error("[/api/panden] error:", e.message);
+    res.status(500).json({ error: e.message });
   }
-  if (gemeente) {
-    const g = `%${gemeente.toLowerCase()}%`;
-    conditions.push(`(
-      LOWER(municipality) LIKE ?
-      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["municipality-name"]')) LIKE ?
-      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["schema:address"]["schema:addressLocality"]')) LIKE ?
-      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["address-municipality"]')) LIKE ?
-      OR LOWER(JSON_EXTRACT(data, '$.raw.attributes["postal-info"]')) LIKE ?
-    )`);
-    params.push(g, g, g, g, g);
-  }
-  if (provincie) { conditions.push("province = ?"); params.push(provincie); }
-  if (status) { conditions.push("status = ?"); params.push(status); }
-  if (minSlaap) { conditions.push("slaapplaatsen >= ?"); params.push(parseInt(minSlaap)); }
-  if (maxSlaap) { conditions.push("slaapplaatsen <= ?"); params.push(parseInt(maxSlaap)); }
-  if (req.query.type) { conditions.push("type = ?"); params.push(req.query.type); }
-  if (req.query.regio) { conditions.push("regio = ?"); params.push(req.query.regio); }
-  if (heeftTelefoon === "1") { conditions.push("phone != ''"); }
-  if (heeftEmail === "1") { conditions.push("email != ''"); }
-  if (heeftWebsite === "1") { conditions.push("website != ''"); }
-
-  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-  const orderBy = req.query.sorteer === "nieuwste" ? "ORDER BY date_online DESC" : "";
-
-  const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
-  const offset = (page - 1) * size;
-  const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
-
-  const properties = rows.map(r => {
-    const parsed = JSON.parse(r.data);
-    return parseLodging(parsed.raw || parsed, parsed.included || []);
-  });
-
-  res.json({
-    data: properties,
-    meta: { total: filteredTotal, dbTotal: total, page, size, pages: Math.ceil(filteredTotal / size) },
-  });
-});
+});;
 
 // GET /api/panden/count
 app.get("/api/panden/count", requireAuth, (req, res) => {
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
   res.json({ total, lastFetch });
+});
+
+// GET /api/debug/municipality — check what's stored (remove after testing)
+app.get("/api/debug/municipality", requireAuth, (req, res) => {
+  const sample = db.prepare("SELECT id, name, municipality, province, postal_code FROM properties LIMIT 20").all();
+  const emptyCount = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
+  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  res.json({ total, emptyMunicipality: emptyCount, sample });
 });
 
 // POST or GET /api/sync - trigger manual sync
@@ -674,6 +684,7 @@ async function startServer() {
   // Migrations: add columns to existing tables if they don't exist yet
   const existingCols = db.prepare("PRAGMA table_info(properties)").all().map(r => r.name);
   const newCols = [
+    ["name", "TEXT"],
     ["municipality", "TEXT"],
     ["province", "TEXT"],
     ["status", "TEXT"],
@@ -684,6 +695,7 @@ async function startServer() {
     ["type", "TEXT"],
     ["regio", "TEXT"],
     ["date_online", "TEXT"],
+    ["postal_code", "TEXT"],
   ];
   for (const [col, type] of newCols) {
     if (!existingCols.includes(col)) {
@@ -692,32 +704,33 @@ async function startServer() {
     }
   }
   // Create indexes now that columns are guaranteed to exist
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_props_name ON properties(name)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_municipality ON properties(municipality)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status)`);
-  // Backfill any rows with empty municipality (existing data)
-  // Force re-backfill all rows (municipality field names were corrected)
-  const unfilled = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
-  if (unfilled > 0) {
-    console.log(`[migration] Will backfill ${unfilled} rows in background...`);
+
+  // Always re-backfill on startup to ensure columns are correct
+  const totalRows = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  if (totalRows > 0) {
+    console.log(`[migration] Will backfill ${totalRows} rows in background...`);
     setTimeout(() => {
       console.log("[migration] Starting backfill...");
       try {
         const rows = db.prepare("SELECT id, data FROM properties").all();
-        const upd = db.prepare("UPDATE properties SET municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=? WHERE id=?");
+        const upd = db.prepare("UPDATE properties SET name=?, municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=?, postal_code=? WHERE id=?");
         let count = 0;
         for (const row of rows) {
           try {
             const stored = JSON.parse(row.data);
             const p = parseLodging(stored.raw || stored, stored.included || []);
-            upd.run(p.municipality||"", p.province||"", p.status||"", p.slaapplaatsen||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", row.id);
+            upd.run(p.name||"", p.municipality||"", p.province||"", p.status||"", p.slaapplaatsen||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", p.postalCode||"", row.id);
             count++;
           } catch(e) {}
         }
         saveDb();
         console.log(`[migration] Backfill complete: ${count} rows`);
       } catch(e) { console.error("[migration] Backfill error:", e.message); }
-    }, 3000); // wait 3s after server starts
+    }, 3000);
   }
 
   ensureDefaultUsers();
