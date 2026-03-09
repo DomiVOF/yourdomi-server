@@ -405,14 +405,21 @@ function parseLodging(raw, included = []) {
     type,
     postalCode,
     street: attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || "",
-    slaapplaatsen,
-    phone,
+    sleepPlaces: parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
+    slaapplaatsen: parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
+    units: parseInt(attr["number-of-rental-units"] || 1),
+    phone: phone || null,
     phoneNorm,
-    email: emails[0] || "",
-    website: websites[0] || "",
+    email: emails[0] || null,
+    website: websites[0] || null,
     images,
-    status,
-    dateOnline,
+    status: status || "aangemeld",
+    starRating: null,
+    onlineSince: attr["modified"] || attr["registration-date"] || "",
+    dateOnline: attr["modified"] || attr["registration-date"] || "",
+    registrationNumber: raw.id,
+    category: attr["category"] || type || "vakantiewoning",
+    rawUrl: `https://linked.toerismevlaanderen.be/id/lodgings/${raw.id}`,
   };
 }
 
@@ -812,7 +819,7 @@ async function startServer() {
           try {
             const stored = JSON.parse(row.data);
             const p = parseLodging(stored.raw || stored, stored.included || []);
-            upd.run(p.name||"", p.municipality||"", p.province||"", p.status||"", p.slaapplaatsen||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", p.postalCode||"", row.id);
+            upd.run(p.name||"", p.municipality||"", p.province||"", p.status||"", p.sleepPlaces||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", p.postalCode||"", row.id);
             count++;
           } catch(e) {}
         }
