@@ -88,8 +88,21 @@ const DB_SCHEMA = `
   CREATE TABLE IF NOT EXISTS properties (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL,
-    fetched_at INTEGER NOT NULL
+    fetched_at INTEGER NOT NULL,
+    municipality TEXT,
+    province TEXT,
+    status TEXT,
+    slaapplaatsen INTEGER,
+    phone TEXT,
+    email TEXT,
+    website TEXT,
+    type TEXT,
+    regio TEXT,
+    date_online TEXT
   );
+  CREATE INDEX IF NOT EXISTS idx_props_municipality ON properties(municipality);
+  CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province);
+  CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status);
 
   CREATE TABLE IF NOT EXISTS enrichment (
     id TEXT PRIMARY KEY,
@@ -201,11 +214,26 @@ async function syncPropertiesFromTV() {
   const now = Date.now();
 
   const insert = db.prepare(
-    "INSERT OR REPLACE INTO properties (id, data, fetched_at) VALUES (?, ?, ?)"
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const insertMany = db.transaction((items) => {
     for (const item of items) {
-      insert.run(item.id, JSON.stringify(item), now);
+      const parsed = parseLodging(item.raw, item.included);
+      insert.run(
+        item.id,
+        JSON.stringify(item),
+        now,
+        parsed.municipality || "",
+        parsed.province || "",
+        parsed.status || "",
+        parsed.slaapplaatsen || 0,
+        parsed.phone || "",
+        parsed.email || "",
+        parsed.website || "",
+        parsed.type || "",
+        parsed.toeristischeRegio || "",
+        parsed.dateOnline || ""
+      );
     }
   });
 
@@ -271,13 +299,16 @@ function parseLodging(raw, included = []) {
   const muniRef = rel.municipality?.data;
   if (muniRef) {
     const muni = getIncluded(muniRef.type, muniRef.id);
-    municipality = muni?.attributes?.name || "";
+    municipality = muni?.attributes?.name || muni?.attributes?.["schema:name"] || "";
     const provRef = muni?.relationships?.province?.data;
     if (provRef) {
       const prov = getIncluded(provRef.type, provRef.id);
-      province = prov?.attributes?.name || "";
+      province = prov?.attributes?.name || prov?.attributes?.["schema:name"] || "";
     }
   }
+  // Fallbacks from attributes
+  if (!municipality) municipality = attr["schema:address"]?.["schema:addressLocality"] || attr["municipality"] || attr["address-municipality"] || "";
+  if (!province) province = attr["schema:address"]?.["schema:addressRegion"] || attr["province"] || "";
 
   // Contact
   const contactInfo = attr["schema:contactPoint"] || [];
@@ -342,51 +373,45 @@ function parseLodging(raw, included = []) {
 app.get("/api/panden", requireAuth, (req, res) => {
   const page = parseInt(req.query.page || "1");
   const size = Math.min(parseInt(req.query.size || "50"), 200);
+  const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
 
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
 
-  // Load all and filter in JS (SQLite JSON queries are complex, this is fast enough for 30k)
-  const allRows = db.prepare("SELECT data FROM properties").all();
-  let properties = allRows.map(r => {
+  // Build SQL WHERE clause from filters
+  const conditions = [];
+  const params = [];
+
+  if (zoek) {
+    conditions.push("(LOWER(JSON_EXTRACT(data, '$.raw.attributes[\"schema:name\"]')) LIKE ? OR LOWER(municipality) LIKE ? OR JSON_EXTRACT(data, '$.raw.attributes[\"schema:address\"][\"schema:postalCode\"]') LIKE ?)");
+    const q = `%${zoek.toLowerCase()}%`;
+    params.push(q, q, `%${zoek}%`);
+  }
+  if (gemeente) { conditions.push("LOWER(municipality) LIKE ?"); params.push(`%${gemeente.toLowerCase()}%`); }
+  if (provincie) { conditions.push("province = ?"); params.push(provincie); }
+  if (status) { conditions.push("status = ?"); params.push(status); }
+  if (minSlaap) { conditions.push("slaapplaatsen >= ?"); params.push(parseInt(minSlaap)); }
+  if (maxSlaap) { conditions.push("slaapplaatsen <= ?"); params.push(parseInt(maxSlaap)); }
+  if (req.query.type) { conditions.push("type = ?"); params.push(req.query.type); }
+  if (req.query.regio) { conditions.push("regio = ?"); params.push(req.query.regio); }
+  if (heeftTelefoon === "1") { conditions.push("phone != ''"); }
+  if (heeftEmail === "1") { conditions.push("email != ''"); }
+  if (heeftWebsite === "1") { conditions.push("website != ''"); }
+
+  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+  const orderBy = req.query.sorteer === "nieuwste" ? "ORDER BY date_online DESC" : "";
+
+  const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
+  const offset = (page - 1) * size;
+  const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
+
+  const properties = rows.map(r => {
     const parsed = JSON.parse(r.data);
     return parseLodging(parsed.raw || parsed, parsed.included || []);
   });
 
-  // Apply filters
-  const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
-
-  if (zoek) {
-    const q = zoek.toLowerCase();
-    properties = properties.filter(p =>
-      p.name?.toLowerCase().includes(q) ||
-      p.municipality?.toLowerCase().includes(q) ||
-      p.postalCode?.includes(q)
-    );
-  }
-  if (gemeente) properties = properties.filter(p => p.municipality?.toLowerCase().includes(gemeente.toLowerCase()));
-  if (provincie) properties = properties.filter(p => p.province === provincie);
-  if (status) properties = properties.filter(p => p.status === status);
-  if (minSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) >= parseInt(minSlaap));
-  if (maxSlaap) properties = properties.filter(p => (p.slaapplaatsen || 0) <= parseInt(maxSlaap));
-  if (req.query.type) properties = properties.filter(p => p.type === req.query.type);
-  if (req.query.regio) properties = properties.filter(p => p.toeristischeRegio === req.query.regio);
-  if (heeftTelefoon === "1") properties = properties.filter(p => !!p.phone);
-  if (heeftEmail === "1") properties = properties.filter(p => !!p.email);
-  if (heeftWebsite === "1") properties = properties.filter(p => !!p.website);
-
-  const filteredTotal = properties.length;
-
-  // Sorting
-  if (req.query.sorteer === "nieuwste") {
-    properties.sort((a, b) => (b.dateOnline || "").localeCompare(a.dateOnline || ""));
-  }
-
-  const offset = (page - 1) * size;
-  const paged = properties.slice(offset, offset + size);
-
   res.json({
-    data: paged,
+    data: properties,
     meta: { total: filteredTotal, dbTotal: total, page, size, pages: Math.ceil(filteredTotal / size) },
   });
 });
@@ -641,6 +666,45 @@ async function startServer() {
   const sqlDb = await initDb(DB_PATH);
   db = new Database(sqlDb);
   db.exec(DB_SCHEMA);
+
+  // Migrations: add columns to existing tables if they don't exist yet
+  const existingCols = db.prepare("PRAGMA table_info(properties)").all().map(r => r.name);
+  const newCols = [
+    ["municipality", "TEXT"],
+    ["province", "TEXT"],
+    ["status", "TEXT"],
+    ["slaapplaatsen", "INTEGER"],
+    ["phone", "TEXT"],
+    ["email", "TEXT"],
+    ["website", "TEXT"],
+    ["type", "TEXT"],
+    ["regio", "TEXT"],
+    ["date_online", "TEXT"],
+  ];
+  for (const [col, type] of newCols) {
+    if (!existingCols.includes(col)) {
+      db.exec(`ALTER TABLE properties ADD COLUMN ${col} ${type}`);
+      console.log(`[migration] Added column: ${col}`);
+    }
+  }
+  // Backfill any rows with empty municipality (existing data)
+  const unfilled = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
+  if (unfilled > 0) {
+    console.log(`[migration] Backfilling ${unfilled} rows with parsed fields...`);
+    const rows = db.prepare("SELECT id, data FROM properties WHERE municipality IS NULL OR municipality = ''").all();
+    const upd = db.prepare("UPDATE properties SET municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=? WHERE id=?");
+    const backfill = db.transaction(() => {
+      for (const row of rows) {
+        try {
+          const stored = JSON.parse(row.data);
+          const p = parseLodging(stored.raw || stored, stored.included || []);
+          upd.run(p.municipality||"", p.province||"", p.status||"", p.slaapplaatsen||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", row.id);
+        } catch(e) {}
+      }
+    });
+    backfill();
+    console.log("[migration] Backfill complete");
+  }
 
   ensureDefaultUsers();
   app.listen(PORT, () => {
