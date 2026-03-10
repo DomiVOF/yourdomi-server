@@ -334,7 +334,7 @@ function ensureDefaultUsers() {
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 
 async function fetchPageFromTV(page = 1, size = 100) {
-  const url = `${TV_BASE}?page[size]=${size}&page[number]=${page}`;
+  const url = `${TV_BASE}?page[size]=${size}&page[number]=${page}&include=contact-points,address,municipality`;
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
     signal: AbortSignal.timeout(60000),
@@ -544,21 +544,31 @@ function parseLodging(raw, included = []) {
   }
   if (!postalCode) postalCode = s(attr["postalCode"] || attr["postcode"] || attr["postal-code"] || attr["locn:postCode"] || "");
 
-  const contactPoints = rel["contact-points"]?.data || [];
-  const phones = [],
-    emails = [],
-    websites = [];
+  const cpData = rel["contact-points"]?.data;
+  const contactPoints = Array.isArray(cpData) ? cpData : (cpData ? [cpData] : []);
+  const phones = [], emails = [], websites = [];
+  const pick = (obj, keys) => {
+    if (!obj) return "";
+    for (const k of keys) {
+      const v = obj[k];
+      if (v != null && String(v).trim()) return String(v).trim();
+    }
+    return "";
+  };
+  const phoneKeys = ["schema:telephone", "telephone", "phone", "contact-phone", "tel", "phoneNumber"];
+  const emailKeys = ["schema:email", "email", "contact-email", "e-mail", "mail"];
+  const urlKeys = ["schema:url", "url", "contact-website", "website", "homepage"];
   for (const cp of contactPoints) {
     const c = included.find((i) => i.type === cp.type && i.id === cp.id);
     if (!c) continue;
     const ca = c.attributes || {};
-    if (ca["schema:telephone"]) phones.push(s(ca["schema:telephone"]));
-    if (ca["schema:email"]) emails.push(s(ca["schema:email"]));
-    if (ca["schema:url"]) websites.push(s(ca["schema:url"]));
+    const tel = pick(ca, phoneKeys); if (tel) phones.push(tel);
+    const em = pick(ca, emailKeys); if (em) emails.push(em);
+    const u = pick(ca, urlKeys); if (u) websites.push(u);
   }
-  if (!phones.length && attr["schema:telephone"]) phones.push(s(attr["schema:telephone"]));
-  if (!emails.length && attr["schema:email"]) emails.push(s(attr["schema:email"]));
-  if (!websites.length && attr["schema:url"]) websites.push(s(attr["schema:url"]));
+  if (!phones.length) { const t = pick(attr, phoneKeys); if (t) phones.push(t); }
+  if (!emails.length) { const e = pick(attr, emailKeys); if (e) emails.push(e); }
+  if (!websites.length) { const w = pick(attr, urlKeys); if (w) websites.push(w); }
 
   const cleanPhone = (p) =>
     s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
