@@ -221,34 +221,38 @@ async function fetchPageFromTV(page = 1, size = 100) {
 
 async function syncPropertiesFromTV() {
   console.log("[sync] Starting fast parallel sync from Toerisme Vlaanderen...");
-  const PAGE_SIZE = 100;
-  const CONCURRENCY = 8;  // parallel requests at once
+  const PAGE_SIZE = 50;   // smaller pages = less memory per batch
+  const CONCURRENCY = 2;  // low concurrency to avoid OOM on Railway
   const now = Date.now();
 
   const insert = db.prepare(
     "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
+  // Process items one at a time — never hold entire batch in memory
+  function insertItem(item) {
+    const parsed = parseLodging(item.raw, item.included);
+    // Only store minimal raw data — drop included to save space
+    const minimal = { raw: item.raw, included: [] };
+    insert.run(
+      item.id,
+      JSON.stringify(minimal),
+      now,
+      parsed.name || "",
+      parsed.municipality || "",
+      parsed.province || "",
+      parsed.status || "",
+      parsed.slaapplaatsen || 0,
+      parsed.phone || "",
+      parsed.email || "",
+      parsed.website || "",
+      parsed.type || "",
+      parsed.toeristischeRegio || "",
+      parsed.dateOnline || "",
+      parsed.postalCode || ""
+    );
+  }
   const insertMany = db.transaction((items) => {
-    for (const item of items) {
-      const parsed = parseLodging(item.raw, item.included);
-      insert.run(
-        item.id,
-        JSON.stringify(item),
-        now,
-        parsed.name || "",
-        parsed.municipality || "",
-        parsed.province || "",
-        parsed.status || "",
-        parsed.slaapplaatsen || 0,
-        parsed.phone || "",
-        parsed.email || "",
-        parsed.website || "",
-        parsed.type || "",
-        parsed.toeristischeRegio || "",
-        parsed.dateOnline || "",
-        parsed.postalCode || ""
-      );
-    }
+    for (const item of items) insertItem(item);
   });
 
   try {
@@ -290,7 +294,9 @@ async function syncPropertiesFromTV() {
       const pct = Math.round(synced / total * 100);
       console.log(`[sync] Pages ${batch[0]}-${batch[batch.length-1]}: ${synced}/${total} (${pct}%)`);
 
-      await new Promise(r => setTimeout(r, 100)); // yield event loop between batches
+      // Release memory and yield between batches
+      if (global.gc) global.gc();
+      await new Promise(r => setTimeout(r, 500));
     }
 
     console.log(`[sync] Done. Synced ${synced} properties.`);
