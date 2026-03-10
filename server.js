@@ -1254,8 +1254,10 @@ Regels:
 });
 
 // Background: light platform scan (website + Airbnb + Booking only) — runs across list, no button
+// Batched + parallel for speed: PLATFORM_SCAN_BATCH per run, PLATFORM_SCAN_PARALLEL concurrent calls
 const PLATFORM_SCAN_DAYS = parseInt(process.env.PLATFORM_SCAN_DAYS || "7");
-const PLATFORM_SCAN_BATCH = parseInt(process.env.PLATFORM_SCAN_BATCH || "5");
+const PLATFORM_SCAN_BATCH = parseInt(process.env.PLATFORM_SCAN_BATCH || "12");
+const PLATFORM_SCAN_PARALLEL = Math.min(parseInt(process.env.PLATFORM_SCAN_PARALLEL || "4"), 8);
 
 async function runOneLightScan(id, name, municipality, website) {
   const prompt = `Voor deze vakantieverhuur in België:
@@ -1314,12 +1316,21 @@ async function runLightScanBatch() {
   const toScan = allIds.filter(r => !scanned.has(r.id) || stale.includes(r.id)).slice(0, PLATFORM_SCAN_BATCH);
   if (toScan.length === 0) return;
   const insert = db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)");
-  for (const row of toScan) {
-    const data = await runOneLightScan(row.id, row.name, row.municipality, row.website);
-    insert.run(row.id, JSON.stringify(data), Date.now());
-    await new Promise(r => setTimeout(r, 2500));
+  const now = Date.now();
+  // Run in parallel chunks of PLATFORM_SCAN_PARALLEL for speed
+  for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
+    const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
+    const results = await Promise.all(chunk.map(row =>
+      runOneLightScan(row.id, row.name, row.municipality, row.website).then(data => ({ id: row.id, data }))
+    ));
+    for (const { id, data } of results) {
+      insert.run(id, JSON.stringify(data), now);
+    }
+    if (i + PLATFORM_SCAN_PARALLEL < toScan.length) {
+      await new Promise(r => setTimeout(r, 800));
+    }
   }
-  console.log("[platform-scan] Scanned", toScan.length, "properties (website/Airbnb/Booking).");
+  console.log("[platform-scan] Scanned", toScan.length, "properties in parallel (website/Airbnb/Booking).");
 }
 
 app.post("/api/monday", requireAuth, async (req, res) => {
