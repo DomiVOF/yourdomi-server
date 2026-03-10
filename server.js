@@ -678,16 +678,38 @@ app.get("/api/panden", requireAuth, (req, res) => {
 
     const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
     const offset = (page - 1) * size;
-    const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
+    const rows = db.prepare(
+      `SELECT id, data, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code, street FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`
+    ).all(...params, size, offset);
 
     const properties = rows.map(r => {
       try {
         const data = JSON.parse(r.data);
         if (data && data.raw && Array.isArray(data.included)) return parseLodging(data.raw, data.included);
         if (data && data.name !== undefined && !data.raw) return data;
-        return data;
-      } catch { return null; }
-    }).filter(Boolean);
+        if (data && typeof data === "object") return data;
+      } catch (_) {}
+      // Fallback: build minimal object from indexed columns so we never drop rows
+      return {
+        id: r.id,
+        name: r.name || "Vakantiewoning",
+        municipality: r.municipality || "",
+        province: r.province || "",
+        street: r.street || "",
+        postalCode: r.postal_code || "",
+        status: r.status || "",
+        slaapplaatsen: r.slaapplaatsen || 0,
+        sleepPlaces: r.slaapplaatsen || 0,
+        units: 1,
+        phone: r.phone || null,
+        email: r.email || null,
+        website: r.website || null,
+        type: r.type || "",
+        toeristischeRegio: r.regio || "",
+        dateOnline: r.date_online || "",
+        onlineSince: r.date_online || "",
+      };
+    });
 
     const totalNum = Number(filteredTotal) || 0;
     const pagesNum = Math.ceil(totalNum / size) || 0;
