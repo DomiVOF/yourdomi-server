@@ -93,6 +93,19 @@ const DB_SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_enrichment_age ON enrichment(enriched_at);
+
+  CREATE INDEX IF NOT EXISTS idx_properties_name ON properties(name);
+  CREATE INDEX IF NOT EXISTS idx_properties_municipality ON properties(municipality);
+  CREATE INDEX IF NOT EXISTS idx_properties_province ON properties(province);
+  CREATE INDEX IF NOT EXISTS idx_properties_status ON properties(status);
+  CREATE INDEX IF NOT EXISTS idx_properties_type ON properties(type);
+  CREATE INDEX IF NOT EXISTS idx_properties_regio ON properties(regio);
+  CREATE INDEX IF NOT EXISTS idx_properties_slaapplaatsen ON properties(slaapplaatsen);
+  CREATE INDEX IF NOT EXISTS idx_properties_date_online ON properties(date_online);
+  CREATE INDEX IF NOT EXISTS idx_properties_postal_code ON properties(postal_code);
+  CREATE INDEX IF NOT EXISTS idx_properties_street ON properties(street);
+  CREATE INDEX IF NOT EXISTS idx_properties_phone ON properties(phone);
+  CREATE INDEX IF NOT EXISTS idx_properties_fetched_at ON properties(fetched_at);
 `;
 
 // =============================================================================
@@ -334,17 +347,8 @@ function ensureDefaultUsers() {
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 
 async function fetchPageFromTV(page = 1, size = 100) {
-  // Maximale data: naam, adres, contact, gemeente via include (JSON:API Toerisme Vlaanderen)
-  const includes = [
-    "contact-points",
-    "address",
-    "addresses",
-    "municipality",
-    "welcome-addresses",
-    "registrations",
-    "main-media",
-    "media",
-  ].join(",");
+  // Only these includes are accepted by the API (municipality causes 500)
+  const includes = ["address", "welcome-addresses", "contact-points", "registrations", "main-media", "media"].join(",");
   const url = `${TV_BASE}?page[size]=${size}&page[number]=${page}&include=${includes}`;
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
@@ -370,13 +374,18 @@ function pickIncludedForItem(raw, included) {
   };
 
   addRelData(rel["contact-points"]?.data);
-  addRelData(rel.municipality?.data);
   addRelData(rel.address?.data);
-  addRelData(rel.addresses?.data);
   addRelData(rel["welcome-addresses"]?.data);
   addRelData(rel.registrations?.data);
   addRelData(rel.media?.data);
   addRelData(rel["main-media"]?.data);
+  const addrRef = rel.address?.data ?? rel["welcome-addresses"]?.data;
+  const addrSingle = addrRef != null ? (Array.isArray(addrRef) ? addrRef[0] : addrRef) : null;
+  if (addrSingle) {
+    const addr = included.find((i) => i.id === addrSingle.id);
+    if (addr?.relationships?.province?.data) addRelData(addr.relationships.province.data);
+    if (addr?.relationships?.municipality?.data) addRelData(addr.relationships.municipality.data);
+  }
 
   const byKey = new Map(included.map((i) => [`${i.type}:${i.id}`, i]));
   for (const key of [...wanted]) {
@@ -512,6 +521,15 @@ function lookupMunicipality() {
   return null;
 }
 
+function findIncluded(ref, included) {
+  if (!ref || !Array.isArray(included) || !included.length) return null;
+  const id = ref.id;
+  const type = ref.type;
+  const byTypeAndId = included.find((i) => i.type === type && i.id === id);
+  if (byTypeAndId) return byTypeAndId;
+  return included.find((i) => i.id === id) || null;
+}
+
 function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
@@ -524,52 +542,63 @@ function parseLodging(raw, included = []) {
   const one = (obj, keys) => {
     if (!obj) return "";
     for (const k of keys) {
-      const v = obj[k];
-      if (v != null && typeof v === "string" && v.trim()) return v.trim();
+      let v = obj[k];
+      if (v == null) continue;
+      if (typeof v === "string" && v.trim()) return v.trim();
+      if (typeof v === "object" && v["@value"] != null) return String(v["@value"]).trim() || "";
+      if (typeof v === "object" && v.value != null) return String(v.value).trim() || "";
+      // TV API: name is array of { content, language }
+      if (Array.isArray(v) && v.length) {
+        const first = v[0];
+        const str = first?.content ?? first?.value ?? first?.["@value"];
+        if (str != null && String(str).trim()) return String(str).trim();
+      }
     }
     return "";
   };
 
-  // ---- 1. STREET (separate field in API) ----
-  const streetKeys = ["street", "straat", "thoroughfare", "locn:thoroughfare", "streetAddress", "schema:streetAddress", "addressStreet"];
-  let street = one(attr, streetKeys);
-  if (!street && attr["schema:address"] && typeof attr["schema:address"] === "object") {
-    street = one(attr["schema:address"], streetKeys);
-  }
+  // ---- 0. ADDRESS REF (used for street, municipality, postalCode) ----
   const addrRef =
     rel.address?.data ??
     rel.addresses?.data ??
     rel["welcome-addresses"]?.data ??
     rel["onthaalAdres"]?.data;
   const addrSingle = addrRef != null ? (Array.isArray(addrRef) ? addrRef[0] : addrRef) : null;
-  if (!street && addrSingle && included.length) {
-    const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
-    if (addr && addr.attributes) street = one(addr.attributes, streetKeys);
+  const addr = addrSingle ? findIncluded(addrSingle, included) : null;
+  const addrAttr = addr?.attributes || {};
+
+  // ---- 1. STREET (TV API uses thoroughfare, sometimes with house-number) ----
+  const streetKeys = ["street", "straat", "thoroughfare", "locn:thoroughfare", "streetAddress", "schema:streetAddress", "addressStreet", "locn:locatorDesignator"];
+  let street = one(attr, streetKeys);
+  if (!street && attr["schema:address"] && typeof attr["schema:address"] === "object") {
+    street = one(attr["schema:address"], streetKeys);
+  }
+  if (!street && addrAttr) {
+    street = one(addrAttr, streetKeys) || one(addrAttr, ["fullAddress", "locn:fullAddress"]);
+    const houseNum = one(addrAttr, ["house-number", "houseNumber", "locatorDesignator"]);
+    if (street && houseNum) street = `${street} ${houseNum}`.trim();
+    else if (houseNum) street = houseNum;
   }
   street = s(street);
 
-  // ---- 2. CITY / MUNICIPALITY (separate field in API) ----
-  const cityKeys = ["municipality", "addressLocality", "schema:addressLocality", "locality", "gemeente", "hoofdgemeente", "city", "adminUnitL2"];
+  // ---- 2. CITY / MUNICIPALITY (TV API address has municipality, province) ----
+  const cityKeys = ["municipality", "addressLocality", "schema:addressLocality", "locality", "gemeente", "hoofdgemeente", "city", "adminUnitL2", "locn:adminUnitL2"];
   let municipality = one(attr, cityKeys);
   if (!municipality && attr["schema:address"] && typeof attr["schema:address"] === "object") {
     municipality = one(attr["schema:address"], cityKeys);
   }
+  if (!municipality && addrAttr) municipality = one(addrAttr, cityKeys) || one(addrAttr, ["name"]) || (addrAttr.name && String(addrAttr.name).trim()) || "";
+  if (!province && addrAttr) province = one(addrAttr, ["province", "adminUnitL1", "schema:addressRegion"]);
   const muniRef = rel.municipality?.data;
   const muniSingle = muniRef != null ? (Array.isArray(muniRef) ? muniRef[0] : muniRef) : null;
-  if (!municipality && muniSingle && included.length) {
-    const muni = included.find((i) => i.type === muniSingle.type && i.id === muniSingle.id);
-    if (muni && muni.attributes) {
-      municipality = one(muni.attributes, ["name", "schema:name", ...cityKeys]);
-      const provRef = muni.relationships?.province?.data;
-      if (provRef) {
-        const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
-        if (prov && prov.attributes) province = prov.attributes.name || "";
-      }
+  const muni = muniSingle ? findIncluded(muniSingle, included) : null;
+  if (!municipality && muni?.attributes) {
+    municipality = one(muni.attributes, ["name", "schema:name", ...cityKeys]);
+    const provRef = muni.relationships?.province?.data;
+    if (provRef && !province) {
+      const prov = findIncluded(Array.isArray(provRef) ? provRef[0] : provRef, included);
+      if (prov?.attributes) province = prov.attributes.name || prov.attributes["schema:name"] || "";
     }
-  }
-  if (!municipality && addrSingle && included.length) {
-    const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
-    if (addr && addr.attributes) municipality = one(addr.attributes, cityKeys) || addr.attributes?.name || "";
   }
   const luEntry = lookupMunicipality(raw.id, uri);
   if (luEntry) {
@@ -581,27 +610,36 @@ function parseLodging(raw, included = []) {
   municipality = s(municipality);
   province = s(province);
 
-  const postalKeys = ["postalCode", "postcode", "postal-code", "locn:postCode"];
+  // ---- POSTAL CODE (TV API uses post-code) ----
+  const postalKeys = ["postalCode", "postcode", "postal-code", "post-code", "locn:postCode", "schema:postalCode"];
   if (!postalCode) postalCode = one(attr, postalKeys);
-  if (!postalCode && addrSingle && included.length) {
-    const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
-    if (addr && addr.attributes) postalCode = one(addr.attributes, postalKeys);
-  }
+  if (!postalCode && addrAttr) postalCode = one(addrAttr, postalKeys);
   postalCode = s(postalCode);
 
-  // ---- 3. NAME = "Vakantiewoning, Straat, Stad" (agreed format) ----
-  const displayName = ["Vakantiewoning", street, municipality].filter(Boolean).join(", ") || "Vakantiewoning";
+  // ---- 3. NAME: use real lodging name from API first; fallback to "Vakantiewoning, Straat, Stad" ----
+  const nameKeys = ["name", "schema:name", "title", "label", "prefLabel", "dcterms:title"];
+  let rawName = one(attr, nameKeys);
+  if (!rawName && rel.registrations?.data) {
+    const regRef = Array.isArray(rel.registrations.data) ? rel.registrations.data[0] : rel.registrations.data;
+    const reg = regRef ? findIncluded(regRef, included) : null;
+    if (reg?.attributes) rawName = one(reg.attributes, nameKeys);
+  }
+  const genericPatterns = /^(pand\s*\d*|vakantiewoning|naamloze|no name|—|\s*)$/i;
+  const isGeneric = !rawName || genericPatterns.test(rawName.trim());
+  const displayName = !isGeneric
+    ? rawName.trim()
+    : (["Vakantiewoning", street, municipality].filter(Boolean).join(", ") || "Vakantiewoning");
 
-  // ---- 4. CONTACT (separate in API) ----
+  // ---- 4. CONTACT ----
   const cpData = rel["contact-points"]?.data;
   const contactPoints = Array.isArray(cpData) ? cpData : (cpData ? [cpData] : []);
   const phones = [], emails = [], websites = [];
   const pick = (obj, keys) => { for (const k of keys) { const v = obj?.[k]; if (v != null && String(v).trim()) return String(v).trim(); } return ""; };
-  const phoneKeys = ["schema:telephone", "telephone", "phone", "contact-phone", "tel"];
-  const emailKeys = ["schema:email", "email", "contact-email", "e-mail"];
-  const urlKeys = ["schema:url", "url", "contact-website", "website"];
+  const phoneKeys = ["schema:telephone", "telephone", "phone", "contact-phone", "tel", "fax"];
+  const emailKeys = ["schema:email", "email", "contact-email", "e-mail", "mail"];
+  const urlKeys = ["schema:url", "url", "contact-website", "website", "homepage"];
   for (const cp of contactPoints) {
-    const c = included.find((i) => i.type === cp.type && i.id === cp.id);
+    const c = findIncluded(cp, included);
     if (!c?.attributes) continue;
     const t = pick(c.attributes, phoneKeys); if (t) phones.push(t);
     const e = pick(c.attributes, emailKeys); if (e) emails.push(e);
@@ -610,14 +648,15 @@ function parseLodging(raw, included = []) {
   if (!phones.length) { const t = pick(attr, phoneKeys); if (t) phones.push(t); }
   if (!emails.length) { const e = pick(attr, emailKeys); if (e) emails.push(e); }
   if (!websites.length) { const w = pick(attr, urlKeys); if (w) websites.push(w); }
-  const cleanPhone = (p) => s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
+  const cleanPhone = (p) =>
+    s(p).replace(/\s/g, "").replace(/^tel:/i, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
   const phone = phones[0] ? cleanPhone(phones[0]) : null;
   const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
   const mainMedia = rel["main-media"]?.data ? [rel["main-media"].data] : [];
   const allMediaRefs = ([]).concat(rel.media?.data || [], mainMedia).filter(Boolean);
   const images = allMediaRefs
-    .map((m) => included.find((i) => i.type === m.type && i.id === m.id)?.attributes?.contentUrl)
+    .map((m) => findIncluded(m, included)?.attributes?.contentUrl)
     .filter(Boolean)
     .slice(0, 5);
 
@@ -696,7 +735,20 @@ app.get("/api/panden", requireAuth, (req, res) => {
     if (heeftWebsite  === "1") conditions.push("website IS NOT NULL AND website != ''");
 
     const where   = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-    const orderBy = req.query.sorteer === "nieuwste" ? "ORDER BY date_online DESC" : "";
+    const sortMap = {
+      nieuwste: "ORDER BY date_online DESC",
+      oudste: "ORDER BY date_online ASC",
+      naam: "ORDER BY name ASC",
+      naam_desc: "ORDER BY name DESC",
+      gemeente: "ORDER BY municipality ASC",
+      gemeente_desc: "ORDER BY municipality DESC",
+      provincie: "ORDER BY province ASC",
+      slaapplaatsen: "ORDER BY slaapplaatsen DESC",
+      slaapplaatsen_asc: "ORDER BY slaapplaatsen ASC",
+      straat: "ORDER BY street ASC",
+      postcode: "ORDER BY postal_code ASC",
+    };
+    const orderBy = sortMap[req.query.sorteer] || "ORDER BY name ASC";
 
     const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
     const offset = (page - 1) * size;
@@ -737,7 +789,14 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const pagesNum = Math.ceil(totalNum / size) || 0;
     res.json({
       data: properties,
-      meta: { total: totalNum, dbTotal: Number(total) || 0, page, size, pages: pagesNum },
+      meta: {
+        total: totalNum,
+        dbTotal: Number(total) || 0,
+        page,
+        size,
+        pages: pagesNum,
+        sort: req.query.sorteer || "naam",
+      },
     });
   } catch (e) {
     console.error("[/api/panden]", e.message);
@@ -761,12 +820,37 @@ app.post("/api/panden/enrich-address", requireAuth, (req, res) => {
 // API ROUTES — META
 // =============================================================================
 
-// GET /api/meta
+// GET /api/meta — facetwaarden voor Power BI–achtige filters (dropdowns, sort)
 app.get("/api/meta", requireAuth, (req, res) => {
   const provinces = db.prepare("SELECT DISTINCT province FROM properties WHERE province IS NOT NULL AND province != '' ORDER BY province").all().map(r => r.province);
-  const types     = db.prepare("SELECT DISTINCT type FROM properties WHERE type IS NOT NULL AND type != '' ORDER BY type").all().map(r => r.type);
-  const regios    = db.prepare("SELECT DISTINCT regio FROM properties WHERE regio IS NOT NULL AND regio != '' ORDER BY regio").all().map(r => r.regio);
-  res.json({ provinces, types, regios });
+  const municipalities = db.prepare("SELECT DISTINCT municipality FROM properties WHERE municipality IS NOT NULL AND municipality != '' ORDER BY municipality").all().map(r => r.municipality);
+  const types = db.prepare("SELECT DISTINCT type FROM properties WHERE type IS NOT NULL AND type != '' ORDER BY type").all().map(r => r.type);
+  const regios = db.prepare("SELECT DISTINCT regio FROM properties WHERE regio IS NOT NULL AND regio != '' ORDER BY regio").all().map(r => r.regio);
+  const statuses = db.prepare("SELECT DISTINCT status FROM properties WHERE status IS NOT NULL AND status != '' ORDER BY status").all().map(r => r.status);
+  const slaapRange = db.prepare("SELECT MIN(slaapplaatsen) as minSlaap, MAX(slaapplaatsen) as maxSlaap FROM properties WHERE slaapplaatsen IS NOT NULL").get();
+  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  res.json({
+    provinces,
+    municipalities,
+    types,
+    regios,
+    statuses,
+    slaapplaatsenRange: total ? { min: slaapRange?.minSlaap ?? 0, max: slaapRange?.maxSlaap ?? 0 } : null,
+    total,
+    sortOptions: [
+      { value: "naam", label: "Naam A–Z" },
+      { value: "naam_desc", label: "Naam Z–A" },
+      { value: "gemeente", label: "Gemeente A–Z" },
+      { value: "gemeente_desc", label: "Gemeente Z–A" },
+      { value: "provincie", label: "Provincie" },
+      { value: "nieuwste", label: "Nieuwste eerst" },
+      { value: "oudste", label: "Oudste eerst" },
+      { value: "slaapplaatsen", label: "Meeste slaapplaatsen" },
+      { value: "slaapplaatsen_asc", label: "Minste slaapplaatsen" },
+      { value: "straat", label: "Straat" },
+      { value: "postcode", label: "Postcode" },
+    ],
+  });
 });
 
 // GET /api/health
@@ -805,7 +889,7 @@ app.get("/api/sync/tv", (req, res) => {
   syncPropertiesFromTV().catch(console.error);
 });
 
-// POST /api/backfill — re-index all stored data into indexed columns
+// POST /api/backfill — re-parse stored data (raw+included) and re-index into columns
 app.post("/api/backfill", requireAuth, (req, res) => {
   res.json({ ok: true, message: "Backfill started" });
   setTimeout(() => {
@@ -818,9 +902,15 @@ app.post("/api/backfill", requireAuth, (req, res) => {
       for (const row of rows) {
         try {
           const p = JSON.parse(row.data);
-          upd.run(p.name,p.municipality,p.province,p.status,p.slaapplaatsen,p.phone,p.email,p.website,p.type,p.toeristischeRegio,p.dateOnline,p.postalCode,p.street,row.id);
+          const parsed = p.raw && Array.isArray(p.included) ? parseLodging(p.raw, p.included) : p;
+          upd.run(
+            parsed.name ?? "", parsed.municipality ?? "", parsed.province ?? "", parsed.status ?? "",
+            parsed.slaapplaatsen ?? 0, parsed.phone ?? "", parsed.email ?? "", parsed.website ?? "",
+            parsed.type ?? "", parsed.toeristischeRegio ?? "", parsed.dateOnline ?? "", parsed.postalCode ?? "", parsed.street ?? "",
+            row.id
+          );
           n++;
-        } catch {}
+        } catch (_) {}
       }
       console.log(`[backfill] Done — ${n} records re-indexed`);
     } catch (e) { console.error("[backfill]", e.message); }
@@ -838,6 +928,24 @@ app.post("/api/admin/cleanup-old-records", requireAuth, (req, res) => {
     db.prepare("DELETE FROM outcomes  WHERE id NOT LIKE 'vf_%'").run();
     res.json({ ok: true, deleted: old, kept: vf });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/reset-db — helemaal opnieuw: leeg properties, enrichment, outcomes (voor fresh TV-sync)
+app.post("/api/admin/reset-db", requireAuth, (req, res) => {
+  try {
+    const p = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+    db.prepare("DELETE FROM properties").run();
+    db.prepare("DELETE FROM enrichment").run();
+    db.prepare("DELETE FROM outcomes").run();
+    console.log("[admin] DB reset — properties, enrichment, outcomes cleared.");
+    res.json({
+      ok: true,
+      message: "Database gereset. Run nu ‘Sync TV-data nu’ om opnieuw te vullen.",
+      deletedProperties: p,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // =============================================================================
@@ -860,6 +968,30 @@ app.get("/api/debug", (req, res) => {
     const noName  = db.prepare("SELECT COUNT(*) as c FROM properties WHERE name IS NULL OR name = '' OR name LIKE 'vf_%'").get().c;
     res.json({ total, withMuni, withPhone, noName, sample });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/debug/tv-sample — fetch one page from TV API and return first lodging + included (to inspect real structure)
+app.get("/api/debug/tv-sample", async (req, res) => {
+  try {
+    const json = await fetchPageFromTV(1, 5);
+    const data = json.data || [];
+    const included = json.included || [];
+    const first = data[0];
+    if (!first) return res.json({ message: "No data in TV response", meta: json.meta });
+    const itemIncluded = pickIncludedForItem(first, included);
+    const parsed = parseLodging(first, itemIncluded);
+    res.json({
+      meta: json.meta,
+      firstRaw: first,
+      firstIncluded: itemIncluded,
+      firstParsed: parsed,
+      allTypesInIncluded: [...new Set(included.map((i) => i.type))],
+      relationshipKeys: first ? Object.keys(first.relationships || {}) : [],
+      attributeKeys: first && first.attributes ? Object.keys(first.attributes) : [],
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e), stack: e.stack });
+  }
 });
 
 // =============================================================================
@@ -1057,11 +1189,11 @@ async function startServer() {
     }
   }
 
-  // Indexes
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_name ON properties(name)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_municipality ON properties(municipality)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_province ON properties(province)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_status ON properties(status)`);
+  // Indexes for filter/sort (Power BI–style) — created in schema too
+  [
+    "name", "municipality", "province", "status", "type", "regio",
+    "slaapplaatsen", "date_online", "postal_code", "street", "phone", "fetched_at",
+  ].forEach((col) => db.exec(`CREATE INDEX IF NOT EXISTS idx_properties_${col} ON properties(${col})`));
 
   ensureDefaultUsers();
 
@@ -1071,18 +1203,24 @@ async function startServer() {
 
     const count = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
     const vfCount = db.prepare("SELECT COUNT(*) as c FROM properties WHERE id LIKE 'vf_%'").get().c;
+    const useTvPrimary = process.env.USE_TV_AS_PRIMARY === "1";
 
     if (count === 0) {
-      console.log("[startup] Empty DB — starting initial VF sync...");
-      syncFromVF().catch(console.error);
-    } else if (vfCount === 0) {
+      if (useTvPrimary) {
+        console.log("[startup] Empty DB + USE_TV_AS_PRIMARY=1 — starting TV sync in background...");
+        syncPropertiesFromTV().catch(console.error);
+      } else {
+        console.log("[startup] Empty DB — starting initial VF sync...");
+        syncFromVF().catch(console.error);
+      }
+    } else if (vfCount === 0 && !useTvPrimary) {
       console.log("[startup] Old UUID data detected — starting fresh VF sync...");
       db.exec("DELETE FROM properties");
       syncFromVF().catch(console.error);
     } else {
       console.log(`[startup] ${count} properties in DB (${vfCount} VF records).`);
     }
-    if (process.env.AUTO_SYNC_TV_ON_STARTUP === "1") {
+    if (process.env.AUTO_SYNC_TV_ON_STARTUP === "1" && count > 0) {
       console.log("[startup] AUTO_SYNC_TV_ON_STARTUP=1 — starting TV sync in background...");
       syncPropertiesFromTV().catch(console.error);
     }
