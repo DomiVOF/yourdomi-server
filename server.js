@@ -494,123 +494,105 @@ const s = (v) =>
   v && typeof v === "string" ? v : Array.isArray(v) ? v[0] || "" : v ? String(v) : "";
 const n = (v) => (isNaN(parseInt(v)) ? 0 : parseInt(v));
 
+function lookupMunicipality() {
+  return null;
+}
+
 function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
 
-  let name = attr["name"] || attr["schema:name"] || `Pand ${String(raw.id || "").slice(-6)}`;
-
   const uri = attr["uri"] || attr["@id"] || "";
-  let municipality = "",
-    province = "",
+  let province = "",
     postalCode = "",
     toeristischeRegio = "";
 
-  const luEntry = lookupMunicipality(name, uri);
-  if (luEntry) {
-    if (!name || name.startsWith("Pand ")) name = luEntry[0] || name;
-    municipality = luEntry[1] || "";
-    province = luEntry[2] || "";
-    postalCode = luEntry[3] || "";
-    toeristischeRegio = luEntry[4] || "";
-  }
-
-  const pickAttr = (obj, keys) => {
+  const one = (obj, keys) => {
     if (!obj) return "";
     for (const k of keys) {
       const v = obj[k];
       if (v != null && typeof v === "string" && v.trim()) return v.trim();
-      if (v != null && typeof v === "object" && !Array.isArray(v)) {
-        const nested = pickAttr(v, ["schema:streetAddress", "streetAddress", "street", "thoroughfare", "locn:thoroughfare"]);
-        if (nested) return nested;
-        const loc = pickAttr(v, ["schema:addressLocality", "addressLocality", "locality", "name"]);
-        if (loc) return loc;
-      }
     }
     return "";
   };
-  const streetKeys = ["street", "straat", "schema:streetAddress", "streetAddress", "thoroughfare", "locn:thoroughfare", "addressStreet"];
-  const localityKeys = ["addressLocality", "schema:addressLocality", "locality", "adminUnitL2", "municipality", "city", "gemeente", "hoofdgemeente"];
-  const postalKeys = ["postalCode", "postcode", "postal-code", "locn:postCode", "postCode"];
 
-  if (!municipality && included.length) {
-    const muniRef = rel.municipality?.data || rel.address?.data;
-    const muniData = muniRef != null ? (Array.isArray(muniRef) ? muniRef[0] : muniRef) : null;
-    if (muniData) {
-      const muni = included.find((i) => i.type === muniData.type && i.id === muniData.id);
-      if (muni) {
-        const ma = muni.attributes || {};
-        municipality = municipality || pickAttr(ma, ["name", "schema:name", ...localityKeys]);
-        const provRef = muni?.relationships?.province?.data;
-        if (provRef) {
-          const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
-          province = prov?.attributes?.name || province || "";
-        }
-      }
-    }
+  // ---- 1. STREET (separate field in API) ----
+  const streetKeys = ["street", "straat", "thoroughfare", "locn:thoroughfare", "streetAddress", "schema:streetAddress", "addressStreet"];
+  let street = one(attr, streetKeys);
+  if (!street && attr["schema:address"] && typeof attr["schema:address"] === "object") {
+    street = one(attr["schema:address"], streetKeys);
   }
-
-  // Address: main resource first, then related address in included (TV: address, addresses, locn:address)
-  let street = pickAttr(attr, streetKeys) || (attr["schema:address"] && pickAttr(attr["schema:address"], streetKeys));
-  let addrRef = rel.address?.data ?? rel.addresses?.data ?? rel["schema:address"]?.data ?? rel["locn:address"]?.data;
-  addrRef = addrRef != null ? (Array.isArray(addrRef) ? addrRef[0] : addrRef) : null;
-  if (included.length && addrRef) {
-    const addr = included.find((i) => i.type === addrRef.type && i.id === addrRef.id);
-    if (addr) {
-      const aa = addr.attributes || {};
-      street = street || pickAttr(aa, streetKeys);
-      postalCode = postalCode || pickAttr(aa, postalKeys);
-      municipality = municipality || pickAttr(aa, localityKeys) || aa?.name || aa?.["schema:name"] || "";
-      const addrMuni = addr.relationships?.municipality?.data ?? addr.relationships?.adminUnit?.data;
-      if (!municipality && addrMuni) {
-        const m2 = included.find((i) => i.type === addrMuni.type && i.id === addrMuni.id);
-        if (m2) municipality = pickAttr(m2.attributes || {}, ["name", "schema:name", ...localityKeys]);
-      }
-    }
+  const addrRef = rel.address?.data ?? rel.addresses?.data;
+  const addrSingle = addrRef != null ? (Array.isArray(addrRef) ? addrRef[0] : addrRef) : null;
+  if (!street && addrSingle && included.length) {
+    const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
+    if (addr && addr.attributes) street = one(addr.attributes, streetKeys);
   }
-  if (!postalCode) postalCode = pickAttr(attr, postalKeys);
   street = s(street);
+
+  // ---- 2. CITY / MUNICIPALITY (separate field in API) ----
+  const cityKeys = ["municipality", "addressLocality", "schema:addressLocality", "locality", "gemeente", "hoofdgemeente", "city", "adminUnitL2"];
+  let municipality = one(attr, cityKeys);
+  if (!municipality && attr["schema:address"] && typeof attr["schema:address"] === "object") {
+    municipality = one(attr["schema:address"], cityKeys);
+  }
+  const muniRef = rel.municipality?.data;
+  const muniSingle = muniRef != null ? (Array.isArray(muniRef) ? muniRef[0] : muniRef) : null;
+  if (!municipality && muniSingle && included.length) {
+    const muni = included.find((i) => i.type === muniSingle.type && i.id === muniSingle.id);
+    if (muni && muni.attributes) {
+      municipality = one(muni.attributes, ["name", "schema:name", ...cityKeys]);
+      const provRef = muni.relationships?.province?.data;
+      if (provRef) {
+        const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
+        if (prov && prov.attributes) province = prov.attributes.name || "";
+      }
+    }
+  }
+  if (!municipality && addrSingle && included.length) {
+    const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
+    if (addr && addr.attributes) municipality = one(addr.attributes, cityKeys) || addr.attributes?.name || "";
+  }
+  const luEntry = lookupMunicipality(raw.id, uri);
+  if (luEntry) {
+    if (!municipality) municipality = luEntry[1] || "";
+    if (!province) province = luEntry[2] || "";
+    if (!postalCode) postalCode = luEntry[3] || "";
+    toeristischeRegio = luEntry[4] || "";
+  }
   municipality = s(municipality);
+  province = s(province);
+
+  const postalKeys = ["postalCode", "postcode", "postal-code", "locn:postCode"];
+  if (!postalCode) postalCode = one(attr, postalKeys);
+  if (!postalCode && addrSingle && included.length) {
+    const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
+    if (addr && addr.attributes) postalCode = one(addr.attributes, postalKeys);
+  }
   postalCode = s(postalCode);
 
-  // Fallback: TV sometimes sends one full address string (locn:fullAddress, fullAddress, address)
-  const fullAddr = s(attr["locn:fullAddress"] || attr["fullAddress"] || (typeof attr.address === "string" ? attr.address : "") || attr["schema:address"]?.description || "");
-  if (fullAddr && !street && !municipality) {
-    street = fullAddr;
-  } else if (fullAddr && !street) {
-    street = fullAddr;
-  } else if (fullAddr && !municipality) {
-    municipality = fullAddr;
-  }
+  // ---- 3. NAME = "Vakantiewoning, Straat, Stad" (agreed format) ----
+  const displayName = ["Vakantiewoning", street, municipality].filter(Boolean).join(", ") || "Vakantiewoning";
 
+  // ---- 4. CONTACT (separate in API) ----
   const cpData = rel["contact-points"]?.data;
   const contactPoints = Array.isArray(cpData) ? cpData : (cpData ? [cpData] : []);
   const phones = [], emails = [], websites = [];
-  const pick = (obj, keys) => {
-    if (!obj) return "";
-    for (const k of keys) {
-      const v = obj[k];
-      if (v != null && String(v).trim()) return String(v).trim();
-    }
-    return "";
-  };
-  const phoneKeys = ["schema:telephone", "telephone", "phone", "contact-phone", "tel", "phoneNumber"];
-  const emailKeys = ["schema:email", "email", "contact-email", "e-mail", "mail"];
-  const urlKeys = ["schema:url", "url", "contact-website", "website", "homepage"];
+  const pick = (obj, keys) => { for (const k of keys) { const v = obj?.[k]; if (v != null && String(v).trim()) return String(v).trim(); } return ""; };
+  const phoneKeys = ["schema:telephone", "telephone", "phone", "contact-phone", "tel"];
+  const emailKeys = ["schema:email", "email", "contact-email", "e-mail"];
+  const urlKeys = ["schema:url", "url", "contact-website", "website"];
   for (const cp of contactPoints) {
     const c = included.find((i) => i.type === cp.type && i.id === cp.id);
-    if (!c) continue;
-    const ca = c.attributes || {};
-    const tel = pick(ca, phoneKeys); if (tel) phones.push(tel);
-    const em = pick(ca, emailKeys); if (em) emails.push(em);
-    const u = pick(ca, urlKeys); if (u) websites.push(u);
+    if (!c?.attributes) continue;
+    const t = pick(c.attributes, phoneKeys); if (t) phones.push(t);
+    const e = pick(c.attributes, emailKeys); if (e) emails.push(e);
+    const u = pick(c.attributes, urlKeys); if (u) websites.push(u);
   }
   if (!phones.length) { const t = pick(attr, phoneKeys); if (t) phones.push(t); }
   if (!emails.length) { const e = pick(attr, emailKeys); if (e) emails.push(e); }
   if (!websites.length) { const w = pick(attr, urlKeys); if (w) websites.push(w); }
-
-  const cleanPhone = (p) =>
-    s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
+  const cleanPhone = (p) => s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
   const phone = phones[0] ? cleanPhone(phones[0]) : null;
   const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
@@ -622,49 +604,21 @@ function parseLodging(raw, included = []) {
     .slice(0, 5);
 
   const slaapplaatsen = parseInt(
-    attr["number-of-sleeping-places"] ||
-      attr["number-of-sleep-places"] ||
-      attr["schema:numberOfRooms"] ||
-      0,
+    attr["number-of-sleeping-places"] || attr["number-of-sleep-places"] || attr["schema:numberOfRooms"] || 0,
   );
-
   const status = attr["registration-status"] || attr.status || "";
-
-  const type =
-    attr["category"] ||
-    attr["dcterms:type"] ||
-    attr["schema:additionalType"] ||
-    attr.type ||
-    "";
-
+  const type = attr["category"] || attr["dcterms:type"] || attr["schema:additionalType"] || attr.type || "";
   const dateOnline = attr["modified"] || attr["registration-date"] || attr["dcterms:created"] || "";
-
-  // Build a display name:
-  // - Gebruik echte naam als die duidelijk is
-  // - Als het een generieke "Pand 123456" is of leeg: "Vakantiewoning in [gemeente]"
-  // - Als er geen gemeente is maar wel provincie: "Vakantiewoning in [provincie]"
-  // - Als er helemaal niets is: "Naamloze woning"
-  let displayName = s(name);
-  if (!displayName || /^pand\s/i.test(displayName)) {
-    if (municipality) {
-      displayName = `Vakantiewoning in ${municipality}`;
-    } else if (province) {
-      displayName = `Vakantiewoning in ${province}`;
-    } else {
-      displayName = "Naamloze woning";
-    }
-  }
 
   return {
     id: s(raw.id),
     name: displayName,
-    municipality: s(municipality),
-    province: s(province),
+    municipality,
+    province,
     toeristischeRegio: s(toeristischeRegio),
     type: s(type),
-    postalCode: s(postalCode),
-    street: street,
-    fullAddress: fullAddr || null,
+    postalCode,
+    street,
     sleepPlaces: n(
       attr["number-of-sleeping-places"] ||
         attr["number-of-sleep-places"] ||
@@ -742,7 +696,7 @@ app.get("/api/panden", requireAuth, (req, res) => {
       // Fallback: build minimal object from indexed columns so we never drop rows
       return {
         id: r.id,
-        name: r.name || "Vakantiewoning",
+        name: ["Vakantiewoning", r.street, r.municipality].filter(Boolean).join(", ") || r.name || "Vakantiewoning",
         municipality: r.municipality || "",
         province: r.province || "",
         street: r.street || "",
