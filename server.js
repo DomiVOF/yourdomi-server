@@ -164,36 +164,140 @@ function ensureDefaultUsers() {
   // persist user records so login works after restart
 }
 
-// -- TOERISME VLAANDEREN FETCH -------------------------------------------------
-const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
+// -- VISITFLANDERS OPEN DATA SYNC ----------------------------------------------
+// Primary data source: opendata.visitflanders.org/sector/accommodation/base_registry
+// This API returns flat JSON with name, address, phone, email in one bulk call.
+// Much better than the linked.toerismevlaanderen.be API which only has 6 fields per record.
 
-async function fetchPageFromTV(page = 1, size = 100) {
-  const url = `https://linked.toerismevlaanderen.be/lodgings?page[size]=${size}&page[number]=${page}`;
+const VF_BASE = "https://opendata.visitflanders.org/sector/accommodation/base_registry.json";
+
+// Map visitflanders promotional_region to province
+const REGIO_TO_PROVINCE = {
+  kust: "West-Vlaanderen",
+  westhoek: "West-Vlaanderen",
+  brugge: "West-Vlaanderen",
+  leieStreek: "West-Vlaanderen",
+  roeselare: "West-Vlaanderen",
+  kortrijk: "West-Vlaanderen",
+  gent: "Oost-Vlaanderen",
+  meetjesland: "Oost-Vlaanderen",
+  waasland: "Oost-Vlaanderen",
+  denderstreek: "Oost-Vlaanderen",
+  vlaamseArdennen: "Oost-Vlaanderen",
+  antwerpen: "Antwerpen",
+  mechelen: "Antwerpen",
+  kempen: "Antwerpen",
+  antwerpseKempen: "Antwerpen",
+  kunststadAntwerpen: "Antwerpen",
+  hasselt: "Limburg",
+  limburgseKempen: "Limburg",
+  haspengouw: "Limburg",
+  leuven: "Vlaams-Brabant",
+  vlaamsBrabant: "Vlaams-Brabant",
+  pajottenland: "Vlaams-Brabant",
+  hageland: "Vlaams-Brabant",
+  brussel: "Brussel",
+};
+
+// Map visitflanders discriminator to a clean Dutch type label
+const DISC_TO_TYPE = {
+  HOLIDAY_COTTAGE: "Vakantiewoning",
+  BED_AND_BREAKFAST: "B&B",
+  HOTEL: "Hotel",
+  HOSTEL: "Hostel",
+  CAMPING: "Camping",
+  HOLIDAY_PARK: "Vakantiepark",
+  GENERIC_ROOMS: "Kamers",
+  GENERIC_TERRAIN: "Terrein",
+  YOUTH_ACCOMMODATION: "Jeugdlogies",
+};
+
+// Map visitflanders status to display label
+const STATUS_MAP = {
+  NOTIFIED: "aangemeld",
+  ACKNOWLEDGED: "erkend",
+  LICENSED: "vergund",
+  STOPPED: "gestopt",
+};
+
+async function fetchVFPage(offset = 0, limit = 500) {
+  const url = `${VF_BASE}?offset=${offset}&limit=${limit}`;
   const res = await fetch(url, {
-    headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
+    headers: { "User-Agent": "YourdomiServer/1.0", "Accept": "application/json" },
     signal: AbortSignal.timeout(60000),
   });
-  if (!res.ok) throw new Error(`TV API ${res.status}: ${await res.text()}`);
-  return res.json();
+  if (!res.ok) throw new Error(`VF API ${res.status} at offset ${offset}: ${await res.text()}`);
+  return res.json(); // returns array directly
+}
+
+function parseVFRecord(rec) {
+  const trim = (v) => (typeof v === "string" ? v.trim() : "") || "";
+  const regio = trim(rec.promotional_region).toLowerCase();
+  const disc = trim(rec.discriminator).toUpperCase();
+
+  // Build a stable ID: use business_product_id prefixed so it doesn't clash with old UUIDs
+  const id = `vf_${rec.business_product_id}`;
+
+  // Name: prefer name_or_number, fallback to name, fallback to street+city
+  const rawName = trim(rec.name_or_number) || trim(rec.name);
+  const street = trim(rec.street);
+  const houseNum = trim(rec.house_number);
+  const box = trim(rec.box_number);
+  const city = trim(rec.main_city_name) || trim(rec.city_name);
+  const postal = trim(rec.postal_code);
+
+  const streetFull = [street, houseNum, box].filter(Boolean).join(" ");
+  const name = rawName || (streetFull && city ? `${streetFull}, ${city}` : city || id);
+
+  // Phone: phone1 is primary, phone2/phone3 secondary
+  const phone = trim(rec.phone1);
+  const phone2 = trim(rec.phone2) || trim(rec.phone3);
+
+  const province = REGIO_TO_PROVINCE[regio] || REGIO_TO_PROVINCE[rec.promotional_region] || "";
+  const type = DISC_TO_TYPE[disc] || trim(rec.discriminator);
+  const status = STATUS_MAP[trim(rec.status).toUpperCase()] || trim(rec.status).toLowerCase();
+
+  // Date online: notification_date or last_status_change_date
+  const dateOnline = trim(rec.notification_date || rec.last_status_change_date || rec.changed_time || "").substring(0, 10);
+
+  return {
+    id,
+    businessProductId: trim(String(rec.business_product_id || "")),
+    name,
+    street: streetFull,
+    municipality: city,
+    postalCode: postal,
+    province,
+    phone,
+    phone2,
+    email: trim(rec.email),
+    website: trim(rec.website),
+    status,
+    slaapplaatsen: parseInt(rec.maximum_capacity) || 0,
+    aantalUnits: parseInt(rec.number_of_units) || 0,
+    type,
+    toeristischeRegio: regio,
+    dateOnline,
+    lat: parseFloat(rec.lat) || null,
+    lng: parseFloat(rec.long) || null,
+    rawUrl: `https://opendata.visitflanders.org/sector/accommodation/base_registry.json?business_product_id=${rec.business_product_id}`,
+  };
 }
 
 async function syncPropertiesFromTV() {
-  console.log("[sync] Starting fast parallel sync from Toerisme Vlaanderen...");
-  const PAGE_SIZE = 50;   // smaller pages = less memory per batch
-  const CONCURRENCY = 2;  // low concurrency to avoid OOM on Railway
+  console.log("[sync] Starting sync from VisitFlanders open data API...");
+  const LIMIT = 500;
+  const CONCURRENCY = 3;
   const now = Date.now();
 
   const insert = db.prepare(
     "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code, street) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
-  // Process items one at a time — never hold entire batch in memory
-  function insertItem(item) {
-    const parsed = parseLodging(item.raw, item.included);
-    // Only store minimal raw data — drop included to save space
-    const minimal = { raw: item.raw, included: [] };
+
+  function insertItem(parsed) {
     insert.run(
-      item.id,
-      JSON.stringify(minimal),
+      parsed.id,
+      JSON.stringify(parsed),
       now,
       parsed.name || "",
       parsed.municipality || "",
@@ -210,61 +314,77 @@ async function syncPropertiesFromTV() {
       parsed.street || ""
     );
   }
-  const insertMany = db.transaction((items) => {
-    for (const item of items) insertItem(item);
+
+  const insertBatch = db.transaction((records) => {
+    for (const r of records) insertItem(r);
   });
 
   try {
-    // Step 1: fetch page 1 to get total count
-    const firstPage = await fetchPageFromTV(1, PAGE_SIZE);
-    const total = firstPage.meta?.count || firstPage.meta?.total || 0;
-    if (!total) { console.log("[sync] No properties found."); return; }
-    const totalPages = Math.ceil(total / PAGE_SIZE);
-    console.log(`[sync] Total: ${total} properties across ${totalPages} pages — ${CONCURRENCY} parallel`);
+    // Step 1: fetch first page to gauge total
+    console.log("[sync] Fetching first page...");
+    const firstPage = await fetchVFPage(0, LIMIT);
+    if (!Array.isArray(firstPage) || firstPage.length === 0) {
+      console.log("[sync] No records returned from VF API.");
+      return;
+    }
 
-    // Store first page
-    const firstItems = (firstPage.data || []).map(item => ({ id: item.id, raw: item, included: firstPage.included || [] }));
-    insertMany(firstItems);
-    let synced = firstItems.length;
+    // Parse and store first batch
+    const firstParsed = firstPage.map(parseVFRecord);
+    insertBatch(firstParsed);
+    let synced = firstParsed.length;
+    console.log(`[sync] First batch: ${synced} records`);
 
-    // Step 2: remaining pages in parallel batches
-    const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
+    // If we got a full page, there are more
+    if (firstPage.length < LIMIT) {
+      console.log(`[sync] Done. Total: ${synced} properties (single page).`);
+      return;
+    }
 
-    for (let i = 0; i < remainingPages.length; i += CONCURRENCY) {
-      const batch = remainingPages.slice(i, i + CONCURRENCY);
-      const results = await Promise.allSettled(batch.map(p => fetchPageFromTV(p, PAGE_SIZE)));
+    // Step 2: keep fetching until we get a partial page
+    let offset = LIMIT;
+    let hasMore = true;
 
-      const toStore = [];
-      for (let j = 0; j < results.length; j++) {
-        const r = results[j];
-        if (r.status === "fulfilled") {
-          (r.value.data || []).forEach(item => toStore.push({ id: item.id, raw: item, included: r.value.included || [] }));
+    while (hasMore) {
+      // Fetch CONCURRENCY pages in parallel
+      const offsets = Array.from({ length: CONCURRENCY }, (_, i) => offset + i * LIMIT);
+      const results = await Promise.allSettled(offsets.map(o => fetchVFPage(o, LIMIT)));
+
+      let gotAny = false;
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        if (r.status === "fulfilled" && Array.isArray(r.value) && r.value.length > 0) {
+          const parsed = r.value.map(parseVFRecord);
+          insertBatch(parsed);
+          synced += parsed.length;
+          gotAny = true;
+          if (r.value.length < LIMIT) {
+            hasMore = false; // last page
+          }
+        } else if (r.status === "rejected") {
+          console.warn(`[sync] Offset ${offsets[i]} failed: ${r.reason?.message}`);
         } else {
-          console.warn(`[sync] Page ${batch[j]} failed: ${r.reason?.message} — retrying`);
-          try {
-            const retry = await fetchPageFromTV(batch[j], PAGE_SIZE);
-            (retry.data || []).forEach(item => toStore.push({ id: item.id, raw: item, included: retry.included || [] }));
-          } catch(e) { console.error(`[sync] Page ${batch[j]} retry failed: ${e.message}`); }
+          hasMore = false; // empty page = done
         }
       }
 
-      insertMany(toStore);
-      synced += toStore.length;
-      const pct = Math.round(synced / total * 100);
-      console.log(`[sync] Pages ${batch[0]}-${batch[batch.length-1]}: ${synced}/${total} (${pct}%)`);
+      offset += CONCURRENCY * LIMIT;
+      const pct = Math.round((synced / Math.max(synced, 1)) * 100);
+      console.log(`[sync] Synced ${synced} records so far...`);
 
-      // Release memory and yield between batches
+      if (!gotAny) hasMore = false;
       if (global.gc) global.gc();
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 300));
     }
 
-    console.log(`[sync] Done. Synced ${synced} properties.`);
+    console.log(`[sync] Done. Total synced: ${synced} properties from VisitFlanders.`);
   } catch (e) {
     console.error("[sync] Error:", e.message);
   }
 }
 
-// -- PARSE LODGING (same logic as frontend) -----------------------------------
+// -- PARSE LODGING — now just reads already-parsed VF data from DB -----------
+// The DB stores the output of parseVFRecord() directly as JSON.
+// This function provides a consistent interface for the API routes.
 const s = (v) => {
   if (!v && v !== 0) return "";
   if (typeof v === "string") return v;
@@ -280,127 +400,45 @@ const s = (v) => {
 };
 const n = (v) => isNaN(parseInt(v)) ? 0 : parseInt(v);
 
-function parseLodging(raw, included = []) {
-  const attr = raw.attributes || {};
-  const rel = raw.relationships || {};
+// parseLodging: reads VF-parsed data from DB. Data is already clean from parseVFRecord().
+// Keeps the same output shape so App.jsx doesn't need changes.
+function parseLodging(stored) {
+  // stored IS already the parseVFRecord() output — just normalize + ensure all fields present
+  if (!stored || typeof stored !== "object") return null;
 
-  // Name
-  let name = attr["name"] || attr["schema:name"] || attr["alternative-name"] || attr["dcterms:title"] || "";
-
-  let municipality = "", province = "", postalCode = "", toeristischeRegio = "";
-
-  // --- MUNICIPALITY / PROVINCE / POSTALCODE ---
-  // 1. Direct attributes (TV API v2 style)
-  municipality = s(
-    attr["municipality-name"] || attr["hoofdgemeente"] || attr["address-municipality"] ||
-    attr["schema:address"]?.["schema:addressLocality"] || ""
-  );
-  province = s(
-    attr["province"] || attr["provincie"] || attr["Provincie"] ||
-    attr["schema:address"]?.["schema:addressRegion"] || ""
-  );
-  postalCode = s(
-    attr["postal-code"] || attr["postcode"] || attr["postalCode"] ||
-    attr["schema:address"]?.["schema:postalCode"] || ""
-  );
-  toeristischeRegio = s(attr["touristRegion"] || attr["toeristischeRegio"] || attr["tourist-region"] || "");
-
-  // 2. Included relationships (TV API v1 style - municipality as related resource)
-  if (!municipality && included.length) {
-    const muniRef = rel.municipality?.data || rel["hoofdgemeente"]?.data;
-    if (muniRef) {
-      const muni = included.find((i) => i.type === muniRef.type && i.id === muniRef.id);
-      if (muni) {
-        municipality = s(muni?.attributes?.name || muni?.attributes?.["schema:name"] || "");
-        const provRef = muni?.relationships?.province?.data;
-        if (provRef) {
-          const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
-          province = s(prov?.attributes?.name || "");
-        }
-        postalCode = s(muni?.attributes?.["postal-code"] || muni?.attributes?.postcode || "");
-      }
-    }
-  }
-
-  // --- STREET ---
-  const street = s(
-    attr["street"] || attr["straat"] || attr["address-street"] ||
-    attr["schema:address"]?.["schema:streetAddress"] ||
-    attr["schema:streetAddress"] || ""
-  );
-
-  // --- CONTACT: phone, email, website ---
-  // TV API stores contacts in contact-points relationship (included resources)
-  const contactPoints = rel["contact-points"]?.data || [];
-  const phones = [], emails = [], websites = [];
-  for (const cp of contactPoints) {
-    const c = included.find(i => i.type === cp.type && i.id === cp.id);
-    if (!c) continue;
-    const ca = c.attributes || {};
-    if (ca["schema:telephone"]) phones.push(s(ca["schema:telephone"]));
-    if (ca["schema:email"])     emails.push(s(ca["schema:email"]));
-    if (ca["schema:url"])       websites.push(s(ca["schema:url"]));
-  }
-  // Also try direct attributes (some TV API versions put contact info directly)
-  const directPhones = [
-    attr["schema:telephone"], attr["phone"], attr["telefoon"],
-    attr["contact-phone"], attr["contactPhone"],
-  ].filter(Boolean);
-  for (const p of directPhones) { const v = s(p); if (v && !phones.includes(v)) phones.push(v); }
-
-  if (!emails.length)   { const v = s(attr["schema:email"] || attr["email"] || attr["contact-email"] || ""); if (v) emails.push(v); }
-  if (!websites.length) { const v = s(attr["schema:url"] || attr["website"] || attr["contact-website"] || ""); if (v) websites.push(v); }
-
-  const cleanPhone = (p) => s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
-  const phone = phones[0] ? cleanPhone(phones[0]) : null;
-  const phone2 = phones[1] ? cleanPhone(phones[1]) : null;
+  const t = (v) => (typeof v === "string" ? v.trim() : "") || "";
+  const phone = t(stored.phone);
+  const phone2 = t(stored.phone2);
   const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
-  // Images
-  const mediaRefs = rel.media?.data || rel["main-media"]?.data ? [rel["main-media"]?.data].filter(Boolean) : [];
-  const allMediaRefs = (rel.media?.data || []).concat(mediaRefs).filter(Boolean);
-  const images = allMediaRefs
-    .map((m) => included.find(i => i.type === m.type && i.id === m.id)?.attributes?.contentUrl)
-    .filter(Boolean)
-    .slice(0, 5);
-
-  // Slaapplaatsen
-  const slaapplaatsen = parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0);
-
-  // Status
-  const status = attr["registration-status"] || attr.status || "";
-
-  // Type
-  const type = attr["category"] || attr["dcterms:type"] || attr["schema:additionalType"] || attr.type || "";
-
-  // Date online
-  const dateOnline = attr["modified"] || attr["registration-date"] || attr["dcterms:created"] || "";
-
   return {
-    id: s(raw.id),
-    name: s(name) || [s(street), s(municipality)].filter(Boolean).join(", ") || `Pand ${s(raw.id).slice(-8)}`,
-    municipality: s(municipality),
-    province: s(province),
-    toeristischeRegio: s(toeristischeRegio),
-    type: s(type),
-    postalCode: s(postalCode),
-    street: s(street),
-    sleepPlaces: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
-    slaapplaatsen: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
-    units: n(attr["number-of-rental-units"] || 1),
-    phone: s(phone) || null,
-    phone2: s(phone2) || null,
-    phoneNorm: s(phoneNorm) || null,
-    email: s(emails[0]) || null,
-    website: s(websites[0]) || null,
-    images: images.map(s).filter(Boolean),
-    status: s(status) || "aangemeld",
+    id: t(stored.id),
+    businessProductId: t(stored.businessProductId),
+    name: t(stored.name) || t(stored.id),
+    municipality: t(stored.municipality),
+    province: t(stored.province),
+    toeristischeRegio: t(stored.toeristischeRegio),
+    type: t(stored.type),
+    postalCode: t(stored.postalCode),
+    street: t(stored.street),
+    sleepPlaces: n(stored.slaapplaatsen),
+    slaapplaatsen: n(stored.slaapplaatsen),
+    units: n(stored.aantalUnits) || 1,
+    phone: phone || null,
+    phone2: phone2 || null,
+    phoneNorm,
+    email: t(stored.email) || null,
+    website: t(stored.website) || null,
+    images: [],
+    status: t(stored.status) || "aangemeld",
     starRating: null,
-    onlineSince: s(attr["modified"] || attr["registration-date"] || ""),
-    dateOnline: s(attr["modified"] || attr["registration-date"] || ""),
-    registrationNumber: s(raw.id),
-    category: s(attr["category"] || type || "vakantiewoning"),
-    rawUrl: `https://linked.toerismevlaanderen.be/id/lodgings/${raw.id}`,
+    onlineSince: t(stored.dateOnline),
+    dateOnline: t(stored.dateOnline),
+    registrationNumber: t(stored.id),
+    category: t(stored.type) || "vakantiewoning",
+    rawUrl: t(stored.rawUrl),
+    lat: stored.lat || null,
+    lng: stored.lng || null,
   };
 }
 
@@ -449,7 +487,7 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const properties = rows.map(r => {
       try {
         const stored = JSON.parse(r.data);
-        return parseLodging(stored.raw || stored, stored.included || []);
+        return parseLodging(stored);
       } catch(e) {
         console.error("[panden] parseLodging error:", e.message);
         return null;
@@ -473,130 +511,54 @@ app.get("/api/panden/count", requireAuth, (req, res) => {
   res.json({ total, lastFetch });
 });
 
-// POST /api/panden/enrich-address — fetch full TV detail for a batch of IDs
-// Body: { ids: ["id1","id2",...] }  (max 20 at a time)
-// Fetches each property's individual URL, extracts address+phone, updates DB
+// POST /api/panden/enrich-address — no-op, VF API provides all data in sync
 app.post("/api/panden/enrich-address", requireAuth, async (req, res) => {
-  const ids = (req.body?.ids || []).slice(0, 20);
-  if (!ids.length) return res.json({ updated: [] });
-
-  const results = [];
-  await Promise.allSettled(ids.map(async (id) => {
-    try {
-      // Check if already enriched (phone or municipality filled)
-      const existing = db.prepare("SELECT phone, municipality, data FROM properties WHERE id = ?").get(id);
-      if (!existing) return;
-      if (existing.phone || existing.municipality) {
-        results.push({ id, skipped: true });
-        return;
-      }
-
-      // Fetch individual property from TV API
-      const url = `https://linked.toerismevlaanderen.be/id/lodgings/${id}`;
-      const r = await fetch(url, {
-        headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!r.ok) { results.push({ id, error: `TV ${r.status}` }); return; }
-      const json = await r.json();
-
-      // TV individual endpoint returns { data: {...}, included: [...] }
-      const raw = json.data || json;
-      const included = json.included || [];
-
-      const parsed = parseLodging(raw, included);
-
-      // Update the stored raw data with the richer individual response
-      const enrichedStored = { raw, included };
-      db.prepare(
-        "UPDATE properties SET data=?, municipality=?, province=?, phone=?, email=?, website=?, postal_code=?, street=?, name=? WHERE id=?"
-      ).run(
-        JSON.stringify(enrichedStored),
-        parsed.municipality || existing.municipality || "",
-        parsed.province || "",
-        parsed.phone || "",
-        parsed.email || "",
-        parsed.website || "",
-        parsed.postalCode || "",
-        parsed.street || "",
-        parsed.name || "",
-        id
-      );
-      results.push({
-        id,
-        name:         parsed.name,
-        municipality: parsed.municipality,
-        province:     parsed.province,
-        postalCode:   parsed.postalCode,
-        street:       parsed.street,
-        phone:        parsed.phone,
-        phone2:       parsed.phone2,
-        email:        parsed.email,
-        website:      parsed.website,
-      });
-    } catch(e) {
-      results.push({ id, error: e.message });
-    }
-  }));
-
-  res.json({ updated: results });
+  res.json({ updated: [], message: "No enrichment needed — VF API provides all data." });
 });
 
-// GET /api/debug/raw — NO AUTH — shows raw stored TV API attributes
+// GET /api/debug/raw — shows sample stored VF data
 app.get("/api/debug/raw", (req, res) => {
   try {
     const rows = db.prepare("SELECT data FROM properties LIMIT 3").all();
     const samples = rows.map(r => {
       const stored = JSON.parse(r.data);
-      const raw = stored.raw || stored;
-      return { id: raw.id, attributeKeys: Object.keys(raw.attributes||{}), relationshipKeys: Object.keys(raw.relationships||{}), includedTypes: [...new Set((stored.included||[]).map(i=>i.type))], includedCount:(stored.included||[]).length, attributes: raw.attributes||{}, firstIncluded:(stored.included||[])[0]||null, parsed: parseLodging(raw, stored.included||[]) };
+      return { stored, parsed: parseLodging(stored) };
     });
     res.json(samples);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/debug/tv/:id — fetch live from TV and show raw response (no auth, for testing)
+// GET /api/debug/tv/:id — show stored record
 app.get("/api/debug/tv/:id", async (req, res) => {
   try {
-    const url = `https://linked.toerismevlaanderen.be/id/lodgings/${req.params.id}`;
-    const r = await fetch(url, {
-      headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
-      signal: AbortSignal.timeout(15000),
-    });
-    const json = await r.json();
-    const raw = json.data || json;
-    const included = json.included || [];
-    res.json({
-      attributeKeys: Object.keys(raw.attributes || {}),
-      attributes: raw.attributes || {},
-      relationshipKeys: Object.keys(raw.relationships || {}),
-      includedCount: included.length,
-      includedTypes: [...new Set(included.map(i => i.type))],
-      included: included,
-      parsed: parseLodging(raw, included),
-    });
+    const row = db.prepare("SELECT data FROM properties WHERE id = ? OR id = ?").get(
+      req.params.id, `vf_${req.params.id}`
+    );
+    if (!row) return res.status(404).json({ error: "Not found" });
+    const stored = JSON.parse(row.data);
+    res.json({ stored, parsed: parseLodging(stored) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/backfill — re-parse all stored raw data and update indexed columns
+// POST /api/backfill — re-index all stored VF data into indexed columns
 app.post("/api/backfill", async (req, res) => {
   res.json({ ok: true, message: "Backfill started in background" });
   setTimeout(async () => {
     try {
-      console.log("[backfill] Re-parsing all stored properties...");
+      console.log("[backfill] Re-indexing all stored VF properties...");
       const rows = db.prepare("SELECT id, data FROM properties").all();
-      const update = db.prepare("UPDATE properties SET name=?,municipality=?,province=?,status=?,slaapplaatsen=?,phone=?,email=?,website=?,type=?,regio=?,date_online=?,postal_code=? WHERE id=?");
+      const update = db.prepare("UPDATE properties SET name=?,municipality=?,province=?,status=?,slaapplaatsen=?,phone=?,email=?,website=?,type=?,regio=?,date_online=?,postal_code=?,street=? WHERE id=?");
       let count = 0;
       for (const row of rows) {
         try {
           const stored = JSON.parse(row.data);
-          const p = parseLodging(stored.raw||stored, stored.included||[]);
-          update.run(p.name,p.municipality,p.province,p.status,p.slaapplaatsen,p.phone,p.email,p.website,p.type,p.toeristischeRegio,p.dateOnline,p.postalCode,row.id);
+          const p = parseLodging(stored);
+          update.run(p.name,p.municipality,p.province,p.status,p.slaapplaatsen,p.phone,p.email,p.website,p.type,p.toeristischeRegio,p.dateOnline,p.postalCode,p.street,row.id);
           count++;
-          if (count%1000===0){console.log("[backfill]",count,"/",rows.length);}
-        } catch(e) { console.warn("[backfill] Error on",row.id,e.message); }
+          if (count % 5000 === 0) { console.log("[backfill]", count, "/", rows.length); }
+        } catch(e) { console.warn("[backfill] Error on", row.id, e.message); }
       }
-            console.log("[backfill] Done. Updated",count,"properties.");
+      console.log("[backfill] Done. Updated", count, "properties.");
     } catch(e) { console.error("[backfill] Error:", e.message); }
   }, 100);
 });
@@ -742,7 +704,7 @@ app.get("/api/meta", requireAuth, (req, res) => {
   for (const r of rows) {
     try {
       const p = JSON.parse(r.data);
-      const parsed = parseLodging(p.raw || p, p.included || []);
+      const parsed = parseLodging(p);
       if (parsed.province) provinces.add(parsed.province);
       if (parsed.type) types.add(parsed.type);
       if (parsed.toeristischeRegio) regios.add(parsed.toeristischeRegio);
