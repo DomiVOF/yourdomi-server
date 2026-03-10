@@ -498,6 +498,64 @@ app.get("/api/panden/count", requireAuth, (req, res) => {
   res.json({ total, lastFetch });
 });
 
+// POST /api/panden/enrich-address — fetch full TV detail for a batch of IDs
+// Body: { ids: ["id1","id2",...] }  (max 20 at a time)
+// Fetches each property's individual URL, extracts address+phone, updates DB
+app.post("/api/panden/enrich-address", requireAuth, async (req, res) => {
+  const ids = (req.body?.ids || []).slice(0, 20);
+  if (!ids.length) return res.json({ updated: [] });
+
+  const results = [];
+  await Promise.allSettled(ids.map(async (id) => {
+    try {
+      // Check if already enriched (phone or municipality filled)
+      const existing = db.prepare("SELECT phone, municipality, data FROM properties WHERE id = ?").get(id);
+      if (!existing) return;
+      if (existing.phone || existing.municipality) {
+        results.push({ id, skipped: true });
+        return;
+      }
+
+      // Fetch individual property from TV API
+      const url = `https://linked.toerismevlaanderen.be/id/lodgings/${id}`;
+      const r = await fetch(url, {
+        headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!r.ok) { results.push({ id, error: `TV ${r.status}` }); return; }
+      const json = await r.json();
+
+      // TV individual endpoint returns { data: {...}, included: [...] }
+      const raw = json.data || json;
+      const included = json.included || [];
+
+      const parsed = parseLodging(raw, included);
+
+      // Update the stored raw data with the richer individual response
+      const enrichedStored = { raw, included };
+      db.prepare(
+        "UPDATE properties SET data=?, municipality=?, province=?, phone=?, email=?, website=?, postal_code=?, name=? WHERE id=?"
+      ).run(
+        JSON.stringify(enrichedStored),
+        parsed.municipality || existing.municipality || "",
+        parsed.province || "",
+        parsed.phone || "",
+        parsed.email || "",
+        parsed.website || "",
+        parsed.postalCode || "",
+        parsed.name || "",
+        id
+      );
+      results.push({ id, municipality: parsed.municipality, phone: parsed.phone, street: parsed.street });
+    } catch(e) {
+      results.push({ id, error: e.message });
+    }
+  }));
+
+  saveDb();
+  res.json({ updated: results });
+});
+
 // GET /api/debug/raw — NO AUTH — shows raw stored TV API attributes
 app.get("/api/debug/raw", (req, res) => {
   try {
