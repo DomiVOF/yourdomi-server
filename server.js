@@ -193,6 +193,7 @@ function ensureDefaultUsers() {
       console.log(`[auth] Updated user: ${u.username}`);
     }
   }
+  saveDb(); // persist user records so login works after restart
 }
 
 // -- TOERISME VLAANDEREN FETCH -------------------------------------------------
