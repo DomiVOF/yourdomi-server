@@ -418,9 +418,6 @@ async function syncPropertiesFromTV() {
   const insertMany = db.transaction((items) => {
     for (const item of items) {
       const parsed = parseLodging(item.raw, item.included);
-      if (!parsed.municipality || String(parsed.municipality).trim() === "") continue;
-      if (!parsed.phone || String(parsed.phone).trim() === "") continue;
-      if (isExcludedType(parsed.type)) continue;
       insert.run(
         sqlVal(item.id),
         sqlVal(JSON.stringify({ raw: item.raw, included: item.included })),
@@ -711,26 +708,9 @@ function parseLodging(raw, included = []) {
   };
 }
 
-const HAS_CITY = " (municipality IS NOT NULL AND TRIM(COALESCE(municipality,'')) != '') ";
-const HAS_PHONE = " (phone IS NOT NULL AND TRIM(COALESCE(phone,'')) != '') ";
-const HAS_CITY_AND_PHONE = HAS_CITY + " AND " + HAS_PHONE;
-
-// Alleen vakantiewoningen: geen B&B, terrein gebonden, camping, hostel, jeugdverblijf, camperterrein
-const EXCLUDED_TYPE_PATTERNS = [
-  "b&b", "bed and breakfast", "terrein gebonden", "camping", "hostel",
-  "jeugdverblijf", "camperterrein", "jeugdherberg", "groepsaccommodatie",
-];
-function isExcludedType(typeStr) {
-  if (!typeStr || typeof typeStr !== "string") return false;
-  const lower = typeStr.toLowerCase().trim();
-  return EXCLUDED_TYPE_PATTERNS.some((p) => lower.includes(p));
-}
-function sqlNotExcludedType() {
-  const conditions = EXCLUDED_TYPE_PATTERNS.map(
-    (p) => `(LOWER(TRIM(COALESCE(type,'')) NOT LIKE '%' || ? || '%')`
-  );
-  return " ( " + conditions.join(" AND ") + " ) ";
-}
+// Geen exclusie meer: alle panden tonen/syncen (Railway heeft meer geheugen)
+const BASE_WHERE = " 1=1 ";
+const BASE_PARAMS = [];
 
 // GET /api/panden — disable cache so client always gets fresh data (avoids 304 with stale/empty body)
 app.get("/api/panden", requireAuth, (req, res) => {
@@ -741,13 +721,13 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
 
     const totalRow = db.prepare(
-      `SELECT COUNT(*) as c FROM properties WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`
-    ).get(...EXCLUDED_TYPE_PATTERNS);
+      `SELECT COUNT(*) as c FROM properties WHERE ${BASE_WHERE}`
+    ).get(...BASE_PARAMS);
     const total = totalRow?.c ?? 0;
     if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
 
-    const conditions = [HAS_CITY_AND_PHONE, sqlNotExcludedType()];
-    const params = [...EXCLUDED_TYPE_PATTERNS];
+    const conditions = [BASE_WHERE];
+    const params = [...BASE_PARAMS];
 
     if (zoek) {
       const q = `%${zoek.toLowerCase()}%`;
@@ -841,8 +821,8 @@ app.get("/api/panden", requireAuth, (req, res) => {
 // GET /api/panden/count
 app.get("/api/panden/count", requireAuth, (req, res) => {
   const row = db
-    .prepare(`SELECT COUNT(*) as c FROM properties WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`)
-    .get(...EXCLUDED_TYPE_PATTERNS);
+    .prepare(`SELECT COUNT(*) as c FROM properties WHERE ${BASE_WHERE}`)
+    .get(...BASE_PARAMS);
   const total = row?.c ?? 0;
   const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
   res.json({ total, lastFetch });
@@ -857,15 +837,15 @@ app.post("/api/panden/enrich-address", requireAuth, (req, res) => {
 // API ROUTES — META
 // =============================================================================
 
-// GET /api/meta — facetwaarden; alleen vakantiewoningen met stad en telefoon
+// GET /api/meta — facetwaarden (alle panden)
 app.get("/api/meta", requireAuth, (req, res) => {
-  const baseWhere = `WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`;
-  const baseParams = [...EXCLUDED_TYPE_PATTERNS];
-  const provinces = db.prepare(`SELECT DISTINCT province FROM properties ${baseWhere} AND province IS NOT NULL AND province != '' ORDER BY province`).all(...baseParams).map(r => r.province);
-  const municipalities = db.prepare(`SELECT DISTINCT municipality FROM properties ${baseWhere} AND municipality IS NOT NULL AND municipality != '' ORDER BY municipality`).all(...baseParams).map(r => r.municipality);
-  const types = db.prepare(`SELECT DISTINCT type FROM properties ${baseWhere} AND type IS NOT NULL AND type != '' ORDER BY type`).all(...baseParams).map(r => r.type);
-  const regios = db.prepare(`SELECT DISTINCT regio FROM properties ${baseWhere} AND regio IS NOT NULL AND regio != '' ORDER BY regio`).all(...baseParams).map(r => r.regio);
-  const statuses = db.prepare(`SELECT DISTINCT status FROM properties ${baseWhere} AND status IS NOT NULL AND status != '' ORDER BY status`).all(...baseParams).map(r => r.status);
+  const baseWhere = `WHERE ${BASE_WHERE}`;
+  const baseParams = [...BASE_PARAMS];
+  const provinces = db.prepare(`SELECT DISTINCT province FROM properties ${baseWhere} AND province IS NOT NULL AND TRIM(COALESCE(province,'')) != '' ORDER BY "province"`).all(...baseParams).map(r => r.province);
+  const municipalities = db.prepare(`SELECT DISTINCT municipality FROM properties ${baseWhere} AND municipality IS NOT NULL AND TRIM(COALESCE(municipality,'')) != '' ORDER BY "municipality"`).all(...baseParams).map(r => r.municipality);
+  const types = db.prepare(`SELECT DISTINCT type FROM properties ${baseWhere} AND type IS NOT NULL AND TRIM(COALESCE(type,'')) != '' ORDER BY "type"`).all(...baseParams).map(r => r.type);
+  const regios = db.prepare(`SELECT DISTINCT regio FROM properties ${baseWhere} AND regio IS NOT NULL AND TRIM(COALESCE(regio,'')) != '' ORDER BY "regio"`).all(...baseParams).map(r => r.regio);
+  const statuses = db.prepare(`SELECT DISTINCT status FROM properties ${baseWhere} AND status IS NOT NULL AND TRIM(COALESCE(status,'')) != '' ORDER BY "status"`).all(...baseParams).map(r => r.status);
   const slaapRange = db.prepare(`SELECT MIN(slaapplaatsen) as minSlaap, MAX(slaapplaatsen) as maxSlaap FROM properties ${baseWhere} AND slaapplaatsen IS NOT NULL`).get(...baseParams);
   const total = db.prepare(`SELECT COUNT(*) as c FROM properties ${baseWhere}`).get(...baseParams).c;
   res.json({
@@ -894,7 +874,7 @@ app.get("/api/meta", requireAuth, (req, res) => {
 
 // GET /api/health
 app.get("/api/health", requireAuth, (req, res) => {
-  const props = db.prepare(`SELECT COUNT(*) as c FROM properties WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`).get(...EXCLUDED_TYPE_PATTERNS)?.c ?? 0;
+  const props = db.prepare(`SELECT COUNT(*) as c FROM properties WHERE ${BASE_WHERE}`).get(...BASE_PARAMS)?.c ?? 0;
   const enriched = db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c;
   const outcomes = db.prepare("SELECT COUNT(*) as c FROM outcomes").get().c;
   const lastSync = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get()?.t;
@@ -987,27 +967,13 @@ app.post("/api/admin/reset-db", requireAuth, (req, res) => {
   }
 });
 
-// POST /api/admin/remove-no-city — ruim DB op: verwijder zonder stad/telefoon én niet-vakantiewoningen (B&B, terrein gebonden, camping, etc.)
+// POST /api/admin/remove-no-city — uitgeschakeld: geen exclusie/verwijdering meer (Railway heeft meer geheugen)
 app.post("/api/admin/remove-no-city", requireAuth, (req, res) => {
-  try {
-    const incomplete =
-      " (municipality IS NULL OR TRIM(COALESCE(municipality,'')) = '' OR phone IS NULL OR TRIM(COALESCE(phone,'')) = '') ";
-    const excludedTypeSql = EXCLUDED_TYPE_PATTERNS.map(
-      (p) => `LOWER(TRIM(COALESCE(type,''))) LIKE '%' || '${String(p).replace(/'/g, "''")}' || '%'`
-    ).join(" OR ");
-    const toDelete = ` (${incomplete} OR (${excludedTypeSql})) `;
-    db.prepare(`DELETE FROM enrichment WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
-    db.prepare(`DELETE FROM outcomes WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
-    const deleted = db.prepare(`DELETE FROM properties WHERE ${toDelete}`).run();
-    console.log("[admin] Cleanup: removed", deleted.changes, "properties (no city/phone or excluded type).");
-    res.json({
-      ok: true,
-      message: "Opgeruimd: panden zonder stad/telefoon en niet-vakantiewoningen (B&B, terrein gebonden, camping, etc.) verwijderd. Vrijgekomen ruimte op Railway.",
-      deleted: deleted.changes,
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  res.json({
+    ok: true,
+    message: "Cleanup uitgeschakeld. Alle panden blijven behouden.",
+    deleted: 0,
+  });
 });
 
 // =============================================================================
@@ -1201,19 +1167,82 @@ app.post("/api/ai", requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/meet/summarize — AI notetaker: extract outcome, note, contactNaam from Google Meet transcript
+app.post("/api/meet/summarize", requireAuth, async (req, res) => {
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "ANTHROPIC_KEY not configured" });
+  const transcript = req.body.transcript;
+  if (!transcript || typeof transcript !== "string" || transcript.trim().length < 20) {
+    return res.status(400).json({ error: "Transcript ontbreekt of te kort. Plak de tekst van je Google Meet-opname." });
+  }
+  const prompt = `Je bent een CRM-assistent voor yourdomi.be (kortetermijnverhuur België). Analyseer dit gesprek/meeting-transcript en haal er gestructureerde notities uit.
+
+TRANSCRIPT (Google Meet / gesprek met klant):
+---
+${transcript.slice(0, 25000)}
+---
+
+Geef ALLEEN een JSON-object terug, geen uitleg:
+{
+  "outcome": "<exact één van: gebeld_interesse | callback | terugbellen | afgewezen | null>",
+  "note": "<korte samenvatting van het gesprek, actiepunten, afspraken, wat de klant zei - in het Nederlands, 2-8 zinnen>",
+  "contactNaam": "<naam van de contactpersoon / eigenaar als die genoemd wordt, anders null>"
+}
+
+Regels:
+- outcome: gebeld_interesse = interesse getoond, afspraak/meeting gepland of wil meer info; callback/terugbellen = moet terugbellen; afgewezen = geen interesse of stopt; null als onduidelijk.
+- note: kern van het gesprek, afspraken, vervolgstappen. Gebruik dezelfde taal als het transcript.
+- contactNaam: alleen de naam (bijv. "Jan Janssen"), geen titel. null als niet genoemd.`;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: prompt }],
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const data = await r.json();
+    const text = data.content?.[0]?.text?.trim() || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+    let parsed;
+    try { parsed = JSON.parse(clean); } catch (_) { return res.status(502).json({ error: "AI gaf geen geldige JSON terug" }); }
+    res.json({
+      outcome: parsed.outcome === "gebeld_interesse" || parsed.outcome === "callback" || parsed.outcome === "terugbellen" || parsed.outcome === "afgewezen" ? parsed.outcome : null,
+      note: typeof parsed.note === "string" ? parsed.note.trim() : "",
+      contactNaam: typeof parsed.contactNaam === "string" ? parsed.contactNaam.trim() || null : null,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") return res.status(504).json({ error: "Timeout" });
+    res.status(500).json({ error: e.message || "AI-samenvatting mislukt" });
+  }
+});
+
 app.post("/api/monday", requireAuth, async (req, res) => {
-  const apiKey = process.env.MONDAY_API_KEY;
+  const apiKey = req.body.apiKey || process.env.MONDAY_API_KEY;
   const { query, variables } = req.body;
-  if (!apiKey) return res.status(500).json({ error: "MONDAY_API_KEY not configured" });
+  if (!apiKey) return res.status(400).json({ error: "Monday API-token ontbreekt. Vul het token in en klik op Verbinden." });
   if (!query) return res.status(400).json({ error: "query required" });
   try {
     const r = await fetch("https://api.monday.com/v2", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: apiKey, "API-Version": "2024-01" },
+      headers: { "Content-Type": "application/json", Authorization: String(apiKey).trim(), "API-Version": "2024-01" },
       body: JSON.stringify({ query, variables: variables || {} }),
+      signal: AbortSignal.timeout(15000),
     });
-    res.json(await r.json());
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { return res.status(502).json({ error: "Monday API gaf geen geldige JSON terug" }); }
+    res.json(data);
+  } catch (e) {
+    if (e.name === "AbortError") return res.status(504).json({ error: "Timeout: Monday API reageerde niet op tijd." });
+    res.status(502).json({ error: e.message || "Kon Monday API niet bereiken." });
+  }
 });
 
 // =============================================================================
@@ -1237,24 +1266,6 @@ async function startServer() {
   };
 
   db.exec(DB_SCHEMA);
-
-  // Startup cleanup: free disk space (Railway SQLITE_FULL) — remove incomplete + excluded types before migrations/indexes
-  try {
-    const incomplete =
-      " (municipality IS NULL OR TRIM(COALESCE(municipality,'')) = '' OR phone IS NULL OR TRIM(COALESCE(phone,'')) = '') ";
-    const excludedTypeSql = EXCLUDED_TYPE_PATTERNS.map(
-      (p) => `LOWER(TRIM(COALESCE(type,''))) LIKE '%' || '${String(p).replace(/'/g, "''")}' || '%'`
-    ).join(" OR ");
-    const toDelete = ` (${incomplete} OR (${excludedTypeSql})) `;
-    db.prepare(`DELETE FROM enrichment WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
-    db.prepare(`DELETE FROM outcomes WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
-    const deleted = db.prepare(`DELETE FROM properties WHERE ${toDelete}`).run();
-    if (deleted.changes > 0) {
-      console.log("[startup] Freed space: removed", deleted.changes, "properties (no city/phone or excluded type).");
-    }
-  } catch (e) {
-    console.warn("[startup] Cleanup skipped:", e.message);
-  }
 
   // Migrations: add any missing columns
   const cols = db.prepare("PRAGMA table_info(properties)").all().map(r => r.name);
