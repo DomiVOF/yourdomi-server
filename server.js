@@ -290,7 +290,19 @@ async function syncPropertiesFromTV() {
 }
 
 // -- PARSE LODGING (same logic as frontend) -----------------------------------
-const s = (v) => (v && typeof v === "string") ? v : (Array.isArray(v) ? v[0] || "" : (v ? String(v) : ""));
+const s = (v) => {
+  if (!v && v !== 0) return "";
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) {
+    const first = v[0];
+    if (!first) return "";
+    if (typeof first === "string") return first;
+    if (typeof first === "object") return first.content || first.value || first.text || first.name || "";
+    return String(first);
+  }
+  if (typeof v === "object") return v.content || v.value || v.text || v.name || "";
+  return String(v);
+};
 const n = (v) => isNaN(parseInt(v)) ? 0 : parseInt(v);
 
 function parseLodging(raw, included = []) {
