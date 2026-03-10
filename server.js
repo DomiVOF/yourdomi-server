@@ -334,7 +334,18 @@ function ensureDefaultUsers() {
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 
 async function fetchPageFromTV(page = 1, size = 100) {
-  const url = `${TV_BASE}?page[size]=${size}&page[number]=${page}&include=contact-points,address,municipality`;
+  // Maximale data: naam, adres, contact, gemeente via include (JSON:API Toerisme Vlaanderen)
+  const includes = [
+    "contact-points",
+    "address",
+    "addresses",
+    "municipality",
+    "welcome-addresses",
+    "registrations",
+    "main-media",
+    "media",
+  ].join(",");
+  const url = `${TV_BASE}?page[size]=${size}&page[number]=${page}&include=${includes}`;
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
     signal: AbortSignal.timeout(60000),
@@ -361,6 +372,9 @@ function pickIncludedForItem(raw, included) {
   addRelData(rel["contact-points"]?.data);
   addRelData(rel.municipality?.data);
   addRelData(rel.address?.data);
+  addRelData(rel.addresses?.data);
+  addRelData(rel["welcome-addresses"]?.data);
+  addRelData(rel.registrations?.data);
   addRelData(rel.media?.data);
   addRelData(rel["main-media"]?.data);
 
@@ -522,7 +536,11 @@ function parseLodging(raw, included = []) {
   if (!street && attr["schema:address"] && typeof attr["schema:address"] === "object") {
     street = one(attr["schema:address"], streetKeys);
   }
-  const addrRef = rel.address?.data ?? rel.addresses?.data;
+  const addrRef =
+    rel.address?.data ??
+    rel.addresses?.data ??
+    rel["welcome-addresses"]?.data ??
+    rel["onthaalAdres"]?.data;
   const addrSingle = addrRef != null ? (Array.isArray(addrRef) ? addrRef[0] : addrRef) : null;
   if (!street && addrSingle && included.length) {
     const addr = included.find((i) => i.type === addrSingle.type && i.id === addrSingle.id);
