@@ -1,81 +1,38 @@
 const express = require("express");
 const cors = require("cors");
-const initSqlJs = require('sql.js');
+const BetterSqlite3 = require('better-sqlite3');
 const fs = require('fs');
 
-// sql.js wrapper that mimics better-sqlite3 API
-let _db = null;
-let _dbPath = null;
+function saveDb() {} // no-op: better-sqlite3 writes to disk automatically
 
-function getDb() { return _db; }
+function initDb(dbPath) {
+  // Ensure directory exists
+  const dir = require('path').dirname(dbPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-async function initDb(dbPath) {
-  _dbPath = dbPath;
-  const SQL = await initSqlJs();
-  if (fs.existsSync(dbPath)) {
-    try {
-      const fileBuffer = fs.readFileSync(dbPath);
-      _db = new SQL.Database(fileBuffer);
-      // Verify integrity — catches "database disk image is malformed"
-      _db.run("PRAGMA integrity_check");
-      console.log("[db] Database loaded and verified OK.");
-    } catch (e) {
-      console.error(`[db] Database corrupt (${e.message}) — deleting and starting fresh.`);
-      try { fs.unlinkSync(dbPath); } catch (_) {}
-      _db = new SQL.Database();
-      console.log("[db] Fresh database created — full TV sync will start.");
-    }
-  } else {
-    _db = new SQL.Database();
-    console.log("[db] No database found — created new.");
+  let db;
+  try {
+    db = new BetterSqlite3(dbPath);
+    db.pragma('journal_mode = WAL');  // WAL mode: safe concurrent reads + writes
+    db.pragma('integrity_check');
+    console.log("[db] Database loaded and verified OK.");
+  } catch(e) {
+    console.error(`[db] Database corrupt (${e.message}) — deleting and starting fresh.`);
+    try { fs.unlinkSync(dbPath); } catch(_) {}
+    db = new BetterSqlite3(dbPath);
+    db.pragma('journal_mode = WAL');
+    console.log("[db] Fresh database created — full TV sync will start.");
   }
-  return _db;
-}
-
-function saveDb() {
-  if (_db && _dbPath) {
-    const data = _db.export();
-    fs.writeFileSync(_dbPath, Buffer.from(data));
-  }
-}
-
-// Minimal better-sqlite3 compatible wrapper
-class Statement {
-  constructor(db, sql) { this.db = db; this.sql = sql; }
-  run(...args) {
-    this.db.run(this.sql, args.flat());
-    // Note: saveDb() is called explicitly after important mutations (login, outcomes, etc.)
-    // NOT here - would be called 25k times during backfill and kill performance
-    return { changes: 1 };
-  }
-  get(...args) {
-    const stmt = this.db.prepare(this.sql);
-    const params = args.flat();
-    if (params.length) stmt.bind(params);
-    const result = stmt.step() ? stmt.getAsObject() : undefined;
-    stmt.free();
-    return result;
-  }
-  all(...args) {
-    const stmt = this.db.prepare(this.sql);
-    const params = args.flat();
-    if (params.length) stmt.bind(params);
-    const results = [];
-    while (stmt.step()) results.push(stmt.getAsObject());
-    stmt.free();
-    return results;
-  }
+  return db;
 }
 
 class Database {
   constructor(db) { this.db = db; }
-  prepare(sql) { return new Statement(this.db, sql); }
-  exec(sql) { this.db.run(sql); saveDb(); }
+  prepare(sql) { return this.db.prepare(sql); }
+  exec(sql) { this.db.exec(sql); }
   transaction(fn) {
-    return (items) => {
-      fn(items); // no transaction wrapper - sql.js auto-commits
-      saveDb();
-    };
+    const t = this.db.transaction(fn);
+    return (items) => t(items);
   }
 }
 const fetch = require("node-fetch");
@@ -203,7 +160,7 @@ function ensureDefaultUsers() {
       console.log(`[auth] Updated user: ${u.username}`);
     }
   }
-  saveDb(); // persist user records so login works after restart
+  // persist user records so login works after restart
 }
 
 // -- TOERISME VLAANDEREN FETCH -------------------------------------------------
@@ -568,7 +525,6 @@ app.post("/api/panden/enrich-address", requireAuth, async (req, res) => {
     }
   }));
 
-  saveDb();
   res.json({ updated: results });
 });
 
@@ -600,11 +556,10 @@ app.post("/api/backfill", async (req, res) => {
           const p = parseLodging(stored.raw||stored, stored.included||[]);
           update.run(p.name,p.municipality,p.province,p.status,p.slaapplaatsen,p.phone,p.email,p.website,p.type,p.toeristischeRegio,p.dateOnline,p.postalCode,row.id);
           count++;
-          if (count%1000===0){console.log("[backfill]",count,"/",rows.length);saveDb();}
+          if (count%1000===0){console.log("[backfill]",count,"/",rows.length);}
         } catch(e) { console.warn("[backfill] Error on",row.id,e.message); }
       }
-      saveDb();
-      console.log("[backfill] Done. Updated",count,"properties.");
+            console.log("[backfill] Done. Updated",count,"properties.");
     } catch(e) { console.error("[backfill] Error:", e.message); }
   }, 100);
 });
@@ -686,7 +641,6 @@ app.post("/api/enrichment/:id", requireAuth, (req, res) => {
     JSON.stringify(data),
     Date.now()
   );
-  saveDb();
   res.json({ ok: true });
 });
 
@@ -723,7 +677,6 @@ app.post("/api/outcomes/:id", requireAuth, (req, res) => {
   db.prepare(
     "INSERT OR REPLACE INTO outcomes (id, outcome, note, contact_naam, updated_at) VALUES (?, ?, ?, ?, ?)"
   ).run(req.params.id, outcome || null, note || null, contactNaam || null, Date.now());
-  saveDb();
   res.json({ ok: true });
 });
 
@@ -801,7 +754,6 @@ app.post("/api/login", (req, res) => {
   db.prepare("INSERT INTO sessions (token, user_id, username, name, created_at, expires_at) VALUES (?,?,?,?,?,?)").run(
     token, user.id, user.username, user.name || user.username, now, expires
   );
-  saveDb();
   res.json({ token, username: user.username, name: user.name || user.username });
 });
 
@@ -893,7 +845,7 @@ app.post("/api/monday", requireAuth, async (req, res) => {
 
 // -- START ---------------------------------------------------------------------
 async function startServer() {
-  const sqlDb = await initDb(DB_PATH);
+  const sqlDb = initDb(DB_PATH);
   db = new Database(sqlDb);
   db.exec(DB_SCHEMA);
 
