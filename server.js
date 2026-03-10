@@ -331,7 +331,6 @@ function ensureDefaultUsers() {
   }
 }
 
-<<<<<<< HEAD
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 
 async function fetchPageFromTV(page = 1, size = 100) {
@@ -628,11 +627,6 @@ function parseLodging(raw, included = []) {
     rawUrl: `https://linked.toerismevlaanderen.be/id/lodgings/${raw.id}`,
   };
 }
-=======
-// =============================================================================
-// API ROUTES — PROPERTIES
-// =============================================================================
->>>>>>> 4258a9338e0066f44b58ce90000b1b9e17f27ded
 
 // GET /api/panden
 app.get("/api/panden", requireAuth, (req, res) => {
