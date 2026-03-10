@@ -69,7 +69,8 @@ const DB_SCHEMA = `
     type TEXT,
     regio TEXT,
     date_online TEXT,
-    postal_code TEXT
+    postal_code TEXT,
+    street TEXT
   );
 
   CREATE TABLE IF NOT EXISTS enrichment (
@@ -183,7 +184,7 @@ async function syncPropertiesFromTV() {
   const now = Date.now();
 
   const insert = db.prepare(
-    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code, street) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   // Process items one at a time — never hold entire batch in memory
   function insertItem(item) {
@@ -205,7 +206,8 @@ async function syncPropertiesFromTV() {
       parsed.type || "",
       parsed.toeristischeRegio || "",
       parsed.dateOnline || "",
-      parsed.postalCode || ""
+      parsed.postalCode || "",
+      parsed.street || ""
     );
   }
   const insertMany = db.transaction((items) => {
@@ -283,7 +285,7 @@ function parseLodging(raw, included = []) {
   const rel = raw.relationships || {};
 
   // Name
-  let name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
+  let name = attr["name"] || attr["schema:name"] || attr["alternative-name"] || attr["dcterms:title"] || "";
 
   let municipality = "", province = "", postalCode = "", toeristischeRegio = "";
 
@@ -376,7 +378,7 @@ function parseLodging(raw, included = []) {
 
   return {
     id: s(raw.id),
-    name: s(name) || "Naamloze woning",
+    name: s(name) || [s(street), s(municipality)].filter(Boolean).join(", ") || `Pand ${s(raw.id).slice(-8)}`,
     municipality: s(municipality),
     province: s(province),
     toeristischeRegio: s(toeristischeRegio),
@@ -507,7 +509,7 @@ app.post("/api/panden/enrich-address", requireAuth, async (req, res) => {
       // Update the stored raw data with the richer individual response
       const enrichedStored = { raw, included };
       db.prepare(
-        "UPDATE properties SET data=?, municipality=?, province=?, phone=?, email=?, website=?, postal_code=?, name=? WHERE id=?"
+        "UPDATE properties SET data=?, municipality=?, province=?, phone=?, email=?, website=?, postal_code=?, street=?, name=? WHERE id=?"
       ).run(
         JSON.stringify(enrichedStored),
         parsed.municipality || existing.municipality || "",
@@ -516,10 +518,22 @@ app.post("/api/panden/enrich-address", requireAuth, async (req, res) => {
         parsed.email || "",
         parsed.website || "",
         parsed.postalCode || "",
+        parsed.street || "",
         parsed.name || "",
         id
       );
-      results.push({ id, municipality: parsed.municipality, phone: parsed.phone, street: parsed.street });
+      results.push({
+        id,
+        name:         parsed.name,
+        municipality: parsed.municipality,
+        province:     parsed.province,
+        postalCode:   parsed.postalCode,
+        street:       parsed.street,
+        phone:        parsed.phone,
+        phone2:       parsed.phone2,
+        email:        parsed.email,
+        website:      parsed.website,
+      });
     } catch(e) {
       results.push({ id, error: e.message });
     }
@@ -538,6 +552,29 @@ app.get("/api/debug/raw", (req, res) => {
       return { id: raw.id, attributeKeys: Object.keys(raw.attributes||{}), relationshipKeys: Object.keys(raw.relationships||{}), includedTypes: [...new Set((stored.included||[]).map(i=>i.type))], includedCount:(stored.included||[]).length, attributes: raw.attributes||{}, firstIncluded:(stored.included||[])[0]||null, parsed: parseLodging(raw, stored.included||[]) };
     });
     res.json(samples);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/debug/tv/:id — fetch live from TV and show raw response (no auth, for testing)
+app.get("/api/debug/tv/:id", async (req, res) => {
+  try {
+    const url = `https://linked.toerismevlaanderen.be/id/lodgings/${req.params.id}`;
+    const r = await fetch(url, {
+      headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
+      signal: AbortSignal.timeout(15000),
+    });
+    const json = await r.json();
+    const raw = json.data || json;
+    const included = json.included || [];
+    res.json({
+      attributeKeys: Object.keys(raw.attributes || {}),
+      attributes: raw.attributes || {},
+      relationshipKeys: Object.keys(raw.relationships || {}),
+      includedCount: included.length,
+      includedTypes: [...new Set(included.map(i => i.type))],
+      included: included,
+      parsed: parseLodging(raw, included),
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -864,6 +901,7 @@ async function startServer() {
     ["regio", "TEXT"],
     ["date_online", "TEXT"],
     ["postal_code", "TEXT"],
+    ["street", "TEXT"],
   ];
   for (const [col, type] of newCols) {
     if (!existingCols.includes(col)) {
