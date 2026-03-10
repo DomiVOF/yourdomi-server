@@ -515,34 +515,63 @@ function parseLodging(raw, included = []) {
     toeristischeRegio = luEntry[4] || "";
   }
 
+  const pickAttr = (obj, keys) => {
+    if (!obj) return "";
+    for (const k of keys) {
+      const v = obj[k];
+      if (v != null && typeof v === "string" && v.trim()) return v.trim();
+      if (v != null && typeof v === "object" && !Array.isArray(v)) {
+        const nested = pickAttr(v, ["schema:streetAddress", "streetAddress", "street", "thoroughfare", "locn:thoroughfare"]);
+        if (nested) return nested;
+        const loc = pickAttr(v, ["schema:addressLocality", "addressLocality", "locality", "name"]);
+        if (loc) return loc;
+      }
+    }
+    return "";
+  };
+  const streetKeys = ["street", "straat", "schema:streetAddress", "streetAddress", "thoroughfare", "locn:thoroughfare", "addressStreet"];
+  const localityKeys = ["addressLocality", "schema:addressLocality", "locality", "adminUnitL2", "municipality", "city", "gemeente", "hoofdgemeente"];
+  const postalKeys = ["postalCode", "postcode", "postal-code", "locn:postCode", "postCode"];
+
   if (!municipality && included.length) {
     const muniRef = rel.municipality?.data || rel.address?.data;
-    if (muniRef) {
-      const muni = included.find((i) => i.type === muniRef.type && i.id === muniRef.id);
+    const muniData = muniRef != null ? (Array.isArray(muniRef) ? muniRef[0] : muniRef) : null;
+    if (muniData) {
+      const muni = included.find((i) => i.type === muniData.type && i.id === muniData.id);
       if (muni) {
-        municipality = muni?.attributes?.name || muni?.attributes?.["schema:name"] || "";
+        const ma = muni.attributes || {};
+        municipality = municipality || pickAttr(ma, ["name", "schema:name", ...localityKeys]);
         const provRef = muni?.relationships?.province?.data;
         if (provRef) {
           const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
-          province = prov?.attributes?.name || "";
+          province = prov?.attributes?.name || province || "";
         }
       }
     }
   }
 
-  // Address from main resource or from related address in included (TV uses locn/thoroughfare, schema:streetAddress)
-  let street = s(attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || attr["thoroughfare"] || attr["locn:thoroughfare"] || "");
-  const addrRef = rel.address?.data != null ? (Array.isArray(rel.address.data) ? rel.address.data[0] : rel.address.data) : null;
-  if (!street && addrRef && included.length) {
+  // Address: main resource first, then related address in included (TV: address, addresses, locn:address)
+  let street = pickAttr(attr, streetKeys) || (attr["schema:address"] && pickAttr(attr["schema:address"], streetKeys));
+  let addrRef = rel.address?.data ?? rel.addresses?.data ?? rel["schema:address"]?.data ?? rel["locn:address"]?.data;
+  addrRef = addrRef != null ? (Array.isArray(addrRef) ? addrRef[0] : addrRef) : null;
+  if (included.length && addrRef) {
     const addr = included.find((i) => i.type === addrRef.type && i.id === addrRef.id);
     if (addr) {
       const aa = addr.attributes || {};
-      street = s(aa["street"] || aa["schema:streetAddress"] || aa["thoroughfare"] || aa["locn:thoroughfare"] || "");
-      if (!postalCode) postalCode = s(aa["postalCode"] || aa["postcode"] || aa["postCode"] || aa["locn:postCode"] || "");
-      if (!municipality) municipality = s(aa["addressLocality"] || aa["schema:addressLocality"] || aa["adminUnitL2"] || "");
+      street = street || pickAttr(aa, streetKeys);
+      postalCode = postalCode || pickAttr(aa, postalKeys);
+      municipality = municipality || pickAttr(aa, localityKeys) || aa?.name || aa?.["schema:name"] || "";
+      const addrMuni = addr.relationships?.municipality?.data ?? addr.relationships?.adminUnit?.data;
+      if (!municipality && addrMuni) {
+        const m2 = included.find((i) => i.type === addrMuni.type && i.id === addrMuni.id);
+        if (m2) municipality = pickAttr(m2.attributes || {}, ["name", "schema:name", ...localityKeys]);
+      }
     }
   }
-  if (!postalCode) postalCode = s(attr["postalCode"] || attr["postcode"] || attr["postal-code"] || attr["locn:postCode"] || "");
+  if (!postalCode) postalCode = pickAttr(attr, postalKeys);
+  street = s(street);
+  municipality = s(municipality);
+  postalCode = s(postalCode);
 
   const cpData = rel["contact-points"]?.data;
   const contactPoints = Array.isArray(cpData) ? cpData : (cpData ? [cpData] : []);
