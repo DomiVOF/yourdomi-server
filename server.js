@@ -76,6 +76,12 @@ const DB_SCHEMA = `
     updated_at  INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS platform_scan (
+    id          TEXT PRIMARY KEY,
+    data        TEXT NOT NULL,
+    scanned_at  INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS users (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     username    TEXT UNIQUE NOT NULL,
@@ -94,6 +100,7 @@ const DB_SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_enrichment_age ON enrichment(enriched_at);
+  CREATE INDEX IF NOT EXISTS idx_platform_scan_age ON platform_scan(scanned_at);
 
   CREATE INDEX IF NOT EXISTS idx_properties_name ON properties(name);
   CREATE INDEX IF NOT EXISTS idx_properties_municipality ON properties(municipality);
@@ -1058,6 +1065,29 @@ app.get("/api/enrichment/stale", requireAuth, (req, res) => {
 });
 
 // =============================================================================
+// PLATFORM SCAN — light AI across list: website + Airbnb + Booking only (no button)
+// =============================================================================
+app.get("/api/platform-scan", requireAuth, (req, res) => {
+  const rows = db.prepare("SELECT id, data, scanned_at FROM platform_scan").all();
+  const result = {};
+  for (const row of rows) {
+    try {
+      result[row.id] = { ...JSON.parse(row.data), _scannedAt: row.scanned_at };
+    } catch (_) { result[row.id] = { _scannedAt: row.scanned_at }; }
+  }
+  res.json(result);
+});
+
+app.post("/api/platform-scan/:id", requireAuth, (req, res) => {
+  const data = req.body;
+  if (!data || typeof data !== "object") return res.status(400).json({ error: "Invalid data" });
+  db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)").run(
+    req.params.id, JSON.stringify(data), Date.now()
+  );
+  res.json({ ok: true });
+});
+
+// =============================================================================
 // API ROUTES — OUTCOMES
 // =============================================================================
 
@@ -1223,6 +1253,75 @@ Regels:
   }
 });
 
+// Background: light platform scan (website + Airbnb + Booking only) — runs across list, no button
+const PLATFORM_SCAN_DAYS = parseInt(process.env.PLATFORM_SCAN_DAYS || "7");
+const PLATFORM_SCAN_BATCH = parseInt(process.env.PLATFORM_SCAN_BATCH || "5");
+
+async function runOneLightScan(id, name, municipality, website) {
+  const prompt = `Voor deze vakantieverhuur in België:
+Naam: ${name || "onbekend"}
+Gemeente: ${municipality || "onbekend"}
+Website uit register: ${website || "geen"}
+
+Voer uit (gebruik web_search):
+1. Zoek: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Airbnb" → vind airbnb.com/rooms/... URL indien aanwezig.
+2. Zoek: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Booking.com" → vind booking.com/hotel/... URL indien aanwezig.
+
+Geef ALLEEN een JSON-object (geen markdown):
+{
+  "website": { "gevonden": true|false, "url": "https://..." of null },
+  "airbnb": { "gevonden": true|false, "url": "https://www.airbnb.com/rooms/..." of null },
+  "booking": { "gevonden": true|false, "url": "https://www.booking.com/hotel/..." of null }
+}`;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 512,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [{ role: "user", content: prompt }],
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+    const data = await r.json();
+    const text = (data.content || []).find(c => c.type === "text")?.text || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
+    const parsed = JSON.parse(clean.slice(s, e + 1));
+    return {
+      website: parsed.website && typeof parsed.website === "object" ? { gevonden: !!parsed.website.gevonden, url: parsed.website.url || null } : { gevonden: false, url: null },
+      airbnb: parsed.airbnb && typeof parsed.airbnb === "object" ? { gevonden: !!parsed.airbnb.gevonden, url: parsed.airbnb.url || null } : { gevonden: false, url: null },
+      booking: parsed.booking && typeof parsed.booking === "object" ? { gevonden: !!parsed.booking.gevonden, url: parsed.booking.url || null } : { gevonden: false, url: null },
+    };
+  } catch (e) {
+    console.warn("[platform-scan] Error for", id, e.message);
+    return { website: { gevonden: false, url: null }, airbnb: { gevonden: false, url: null }, booking: { gevonden: false, url: null } };
+  }
+}
+
+async function runLightScanBatch() {
+  if (!ANTHROPIC_KEY || !db) return;
+  const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
+  const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
+  const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
+  const allIds = db.prepare("SELECT id, name, municipality, website FROM properties").all();
+  const toScan = allIds.filter(r => !scanned.has(r.id) || stale.includes(r.id)).slice(0, PLATFORM_SCAN_BATCH);
+  if (toScan.length === 0) return;
+  const insert = db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)");
+  for (const row of toScan) {
+    const data = await runOneLightScan(row.id, row.name, row.municipality, row.website);
+    insert.run(row.id, JSON.stringify(data), Date.now());
+    await new Promise(r => setTimeout(r, 2500));
+  }
+  console.log("[platform-scan] Scanned", toScan.length, "properties (website/Airbnb/Booking).");
+}
+
 app.post("/api/monday", requireAuth, async (req, res) => {
   const apiKey = req.body.apiKey || process.env.MONDAY_API_KEY;
   const { query, variables } = req.body;
@@ -1314,6 +1413,15 @@ async function startServer() {
     if (process.env.AUTO_SYNC_TV_ON_STARTUP === "1" && count > 0) {
       console.log("[startup] AUTO_SYNC_TV_ON_STARTUP=1 — starting TV sync in background...");
       syncPropertiesFromTV().catch(console.error);
+    }
+    if (process.env.PLATFORM_SCAN_ENABLED === "1" && ANTHROPIC_KEY) {
+      setTimeout(() => {
+        runLightScanBatch().then(() => {
+          const interval = setInterval(runLightScanBatch, 2 * 60 * 1000);
+          interval.unref?.();
+        }).catch(console.error);
+        console.log("[startup] Platform scan (website/Airbnb/Booking) enabled — running in background.");
+      }, 15000);
     }
   });
 }
