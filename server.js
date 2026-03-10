@@ -1238,6 +1238,24 @@ async function startServer() {
 
   db.exec(DB_SCHEMA);
 
+  // Startup cleanup: free disk space (Railway SQLITE_FULL) — remove incomplete + excluded types before migrations/indexes
+  try {
+    const incomplete =
+      " (municipality IS NULL OR TRIM(COALESCE(municipality,'')) = '' OR phone IS NULL OR TRIM(COALESCE(phone,'')) = '') ";
+    const excludedTypeSql = EXCLUDED_TYPE_PATTERNS.map(
+      (p) => `LOWER(TRIM(COALESCE(type,''))) LIKE '%' || '${String(p).replace(/'/g, "''")}' || '%'`
+    ).join(" OR ");
+    const toDelete = ` (${incomplete} OR (${excludedTypeSql})) `;
+    db.prepare(`DELETE FROM enrichment WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
+    db.prepare(`DELETE FROM outcomes WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
+    const deleted = db.prepare(`DELETE FROM properties WHERE ${toDelete}`).run();
+    if (deleted.changes > 0) {
+      console.log("[startup] Freed space: removed", deleted.changes, "properties (no city/phone or excluded type).");
+    }
+  } catch (e) {
+    console.warn("[startup] Cleanup skipped:", e.message);
+  }
+
   // Migrations: add any missing columns
   const cols = db.prepare("PRAGMA table_info(properties)").all().map(r => r.name);
   for (const [col, type] of [
