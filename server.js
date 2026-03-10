@@ -573,6 +573,16 @@ function parseLodging(raw, included = []) {
   municipality = s(municipality);
   postalCode = s(postalCode);
 
+  // Fallback: TV sometimes sends one full address string (locn:fullAddress, fullAddress, address)
+  const fullAddr = s(attr["locn:fullAddress"] || attr["fullAddress"] || (typeof attr.address === "string" ? attr.address : "") || attr["schema:address"]?.description || "");
+  if (fullAddr && !street && !municipality) {
+    street = fullAddr;
+  } else if (fullAddr && !street) {
+    street = fullAddr;
+  } else if (fullAddr && !municipality) {
+    municipality = fullAddr;
+  }
+
   const cpData = rel["contact-points"]?.data;
   const contactPoints = Array.isArray(cpData) ? cpData : (cpData ? [cpData] : []);
   const phones = [], emails = [], websites = [];
@@ -654,6 +664,7 @@ function parseLodging(raw, included = []) {
     type: s(type),
     postalCode: s(postalCode),
     street: street,
+    fullAddress: fullAddr || null,
     sleepPlaces: n(
       attr["number-of-sleeping-places"] ||
         attr["number-of-sleep-places"] ||
