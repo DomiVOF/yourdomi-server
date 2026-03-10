@@ -309,40 +309,53 @@ function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
 
-  // Name — this is what we match against the Excel lookup
+  // Name
   let name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
 
-  // Municipality — use Excel lookup: primary by registration number (from URI), fallback by name
-  const uri = attr["uri"] || attr["@id"] || "";
   let municipality = "", province = "", postalCode = "", toeristischeRegio = "";
 
-  const luEntry = lookupMunicipality(name, uri);
-  if (luEntry) {
-    // luEntry: [name, municipality, province, postalCode, regio]
-    if (!name || name.startsWith("Pand ")) name = luEntry[0] || name; // use Excel name if TV API name empty
-    municipality      = luEntry[1] || "";
-    province          = luEntry[2] || "";
-    postalCode        = luEntry[3] || "";
-    toeristischeRegio = luEntry[4] || "";
-  }
+  // --- MUNICIPALITY / PROVINCE / POSTALCODE ---
+  // 1. Direct attributes (TV API v2 style)
+  municipality = s(
+    attr["municipality-name"] || attr["hoofdgemeente"] || attr["address-municipality"] ||
+    attr["schema:address"]?.["schema:addressLocality"] || ""
+  );
+  province = s(
+    attr["province"] || attr["provincie"] || attr["Provincie"] ||
+    attr["schema:address"]?.["schema:addressRegion"] || ""
+  );
+  postalCode = s(
+    attr["postal-code"] || attr["postcode"] || attr["postalCode"] ||
+    attr["schema:address"]?.["schema:postalCode"] || ""
+  );
+  toeristischeRegio = s(attr["touristRegion"] || attr["toeristischeRegio"] || attr["tourist-region"] || "");
 
-  // Fallback: try included (works when individual property is fetched)
+  // 2. Included relationships (TV API v1 style - municipality as related resource)
   if (!municipality && included.length) {
-    const muniRef = rel.municipality?.data || rel.address?.data;
+    const muniRef = rel.municipality?.data || rel["hoofdgemeente"]?.data;
     if (muniRef) {
       const muni = included.find((i) => i.type === muniRef.type && i.id === muniRef.id);
       if (muni) {
-        municipality = muni?.attributes?.name || muni?.attributes?.["schema:name"] || "";
+        municipality = s(muni?.attributes?.name || muni?.attributes?.["schema:name"] || "");
         const provRef = muni?.relationships?.province?.data;
         if (provRef) {
           const prov = included.find((i) => i.type === provRef.type && i.id === provRef.id);
-          province = prov?.attributes?.name || "";
+          province = s(prov?.attributes?.name || "");
         }
+        postalCode = s(muni?.attributes?.["postal-code"] || muni?.attributes?.postcode || "");
       }
     }
   }
 
-  // Contact — TV API uses contact-points relationship
+  // --- STREET ---
+  const street = s(
+    attr["street"] || attr["straat"] || attr["address-street"] ||
+    attr["schema:address"]?.["schema:streetAddress"] ||
+    attr["schema:streetAddress"] || ""
+  );
+
+  // --- CONTACT: phone, email, website ---
+  // TV API stores contacts in contact-points relationship (included resources)
   const contactPoints = rel["contact-points"]?.data || [];
   const phones = [], emails = [], websites = [];
   for (const cp of contactPoints) {
@@ -353,13 +366,19 @@ function parseLodging(raw, included = []) {
     if (ca["schema:email"])     emails.push(s(ca["schema:email"]));
     if (ca["schema:url"])       websites.push(s(ca["schema:url"]));
   }
-  // Also check direct attributes (older TV API format)
-  if (!phones.length && attr["schema:telephone"]) phones.push(s(attr["schema:telephone"]));
-  if (!emails.length && attr["schema:email"])     emails.push(s(attr["schema:email"]));
-  if (!websites.length && attr["schema:url"])     websites.push(s(attr["schema:url"]));
+  // Also try direct attributes (some TV API versions put contact info directly)
+  const directPhones = [
+    attr["schema:telephone"], attr["phone"], attr["telefoon"],
+    attr["contact-phone"], attr["contactPhone"],
+  ].filter(Boolean);
+  for (const p of directPhones) { const v = s(p); if (v && !phones.includes(v)) phones.push(v); }
+
+  if (!emails.length)   { const v = s(attr["schema:email"] || attr["email"] || attr["contact-email"] || ""); if (v) emails.push(v); }
+  if (!websites.length) { const v = s(attr["schema:url"] || attr["website"] || attr["contact-website"] || ""); if (v) websites.push(v); }
 
   const cleanPhone = (p) => s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
   const phone = phones[0] ? cleanPhone(phones[0]) : null;
+  const phone2 = phones[1] ? cleanPhone(phones[1]) : null;
   const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
   // Images
@@ -390,11 +409,12 @@ function parseLodging(raw, included = []) {
     toeristischeRegio: s(toeristischeRegio),
     type: s(type),
     postalCode: s(postalCode),
-    street: s(attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || ""),
+    street: s(street),
     sleepPlaces: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
     slaapplaatsen: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
     units: n(attr["number-of-rental-units"] || 1),
     phone: s(phone) || null,
+    phone2: s(phone2) || null,
     phoneNorm: s(phoneNorm) || null,
     email: s(emails[0]) || null,
     website: s(websites[0]) || null,
@@ -476,6 +496,43 @@ app.get("/api/panden/count", requireAuth, (req, res) => {
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
   res.json({ total, lastFetch });
+});
+
+// GET /api/debug/raw — NO AUTH — shows raw stored TV API attributes
+app.get("/api/debug/raw", (req, res) => {
+  try {
+    const rows = db.prepare("SELECT data FROM properties LIMIT 3").all();
+    const samples = rows.map(r => {
+      const stored = JSON.parse(r.data);
+      const raw = stored.raw || stored;
+      return { id: raw.id, attributeKeys: Object.keys(raw.attributes||{}), relationshipKeys: Object.keys(raw.relationships||{}), includedTypes: [...new Set((stored.included||[]).map(i=>i.type))], includedCount:(stored.included||[]).length, attributes: raw.attributes||{}, firstIncluded:(stored.included||[])[0]||null, parsed: parseLodging(raw, stored.included||[]) };
+    });
+    res.json(samples);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/backfill — re-parse all stored raw data and update indexed columns
+app.post("/api/backfill", async (req, res) => {
+  res.json({ ok: true, message: "Backfill started in background" });
+  setTimeout(async () => {
+    try {
+      console.log("[backfill] Re-parsing all stored properties...");
+      const rows = db.prepare("SELECT id, data FROM properties").all();
+      const update = db.prepare("UPDATE properties SET name=?,municipality=?,province=?,status=?,slaapplaatsen=?,phone=?,email=?,website=?,type=?,regio=?,date_online=?,postal_code=? WHERE id=?");
+      let count = 0;
+      for (const row of rows) {
+        try {
+          const stored = JSON.parse(row.data);
+          const p = parseLodging(stored.raw||stored, stored.included||[]);
+          update.run(p.name,p.municipality,p.province,p.status,p.slaapplaatsen,p.phone,p.email,p.website,p.type,p.toeristischeRegio,p.dateOnline,p.postalCode,row.id);
+          count++;
+          if (count%1000===0){console.log("[backfill]",count,"/",rows.length);saveDb();}
+        } catch(e) { console.warn("[backfill] Error on",row.id,e.message); }
+      }
+      saveDb();
+      console.log("[backfill] Done. Updated",count,"properties.");
+    } catch(e) { console.error("[backfill] Error:", e.message); }
+  }, 100);
 });
 
 // GET /api/debug — NO AUTH — shows raw stored data so we can fix field names
