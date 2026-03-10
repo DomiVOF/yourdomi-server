@@ -34,7 +34,8 @@ class Statement {
   constructor(db, sql) { this.db = db; this.sql = sql; }
   run(...args) {
     this.db.run(this.sql, args.flat());
-    saveDb();
+    // Note: saveDb() is called explicitly after important mutations (login, outcomes, etc.)
+    // NOT here - would be called 25k times during backfill and kill performance
     return { changes: 1 };
   }
   get(...args) {
@@ -541,6 +542,7 @@ app.post("/api/enrichment/:id", requireAuth, (req, res) => {
     JSON.stringify(data),
     Date.now()
   );
+  saveDb();
   res.json({ ok: true });
 });
 
@@ -577,6 +579,7 @@ app.post("/api/outcomes/:id", requireAuth, (req, res) => {
   db.prepare(
     "INSERT OR REPLACE INTO outcomes (id, outcome, note, contact_naam, updated_at) VALUES (?, ?, ?, ?, ?)"
   ).run(req.params.id, outcome || null, note || null, contactNaam || null, Date.now());
+  saveDb();
   res.json({ ok: true });
 });
 
@@ -654,6 +657,7 @@ app.post("/api/login", (req, res) => {
   db.prepare("INSERT INTO sessions (token, user_id, username, name, created_at, expires_at) VALUES (?,?,?,?,?,?)").run(
     token, user.id, user.username, user.name || user.username, now, expires
   );
+  saveDb();
   res.json({ token, username: user.username, name: user.name || user.username });
 });
 
