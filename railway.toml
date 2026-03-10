@@ -2,7 +2,7 @@
 builder = "nixpacks"
 
 [build.nixpacksPlan.phases.setup]
-nixPkgs = ["python3", "nodejs_22", "nodePackages.node-gyp"]
+nixPkgs = ["python3", "gcc", "gnumake"]
 
 [deploy]
 startCommand = "npm start"
