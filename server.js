@@ -13,12 +13,22 @@ async function initDb(dbPath) {
   _dbPath = dbPath;
   const SQL = await initSqlJs();
   if (fs.existsSync(dbPath)) {
-    const fileBuffer = fs.readFileSync(dbPath);
-    _db = new SQL.Database(fileBuffer);
+    try {
+      const fileBuffer = fs.readFileSync(dbPath);
+      _db = new SQL.Database(fileBuffer);
+      // Verify integrity — catches "database disk image is malformed"
+      _db.run("PRAGMA integrity_check");
+      console.log("[db] Database loaded and verified OK.");
+    } catch (e) {
+      console.error(`[db] Database corrupt (${e.message}) — deleting and starting fresh.`);
+      try { fs.unlinkSync(dbPath); } catch (_) {}
+      _db = new SQL.Database();
+      console.log("[db] Fresh database created — full TV sync will start.");
+    }
   } else {
     _db = new SQL.Database();
+    console.log("[db] No database found — created new.");
   }
-  // Persist to disk after every write
   return _db;
 }
 
