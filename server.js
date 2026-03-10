@@ -643,8 +643,9 @@ function parseLodging(raw, included = []) {
   };
 }
 
-// GET /api/panden
+// GET /api/panden — disable cache so client always gets fresh data (avoids 304 with stale/empty body)
 app.get("/api/panden", requireAuth, (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   try {
     const page = parseInt(req.query.page || "1");
     const size = Math.min(parseInt(req.query.size || "50"), 200);
@@ -688,9 +689,11 @@ app.get("/api/panden", requireAuth, (req, res) => {
       } catch { return null; }
     }).filter(Boolean);
 
+    const totalNum = Number(filteredTotal) || 0;
+    const pagesNum = Math.ceil(totalNum / size) || 0;
     res.json({
       data: properties,
-      meta: { total: filteredTotal, dbTotal: total, page, size, pages: Math.ceil(filteredTotal / size) },
+      meta: { total: totalNum, dbTotal: Number(total) || 0, page, size, pages: pagesNum },
     });
   } catch (e) {
     console.error("[/api/panden]", e.message);
