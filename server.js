@@ -781,29 +781,8 @@ async function startServer() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status)`);
 
-  // Always re-backfill on startup to ensure columns are correct
-  const totalRows = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
-  if (totalRows > 0) {
-    console.log(`[migration] Will backfill ${totalRows} rows in background...`);
-    setTimeout(() => {
-      console.log("[migration] Starting backfill...");
-      try {
-        const rows = db.prepare("SELECT id, data FROM properties").all();
-        const upd = db.prepare("UPDATE properties SET name=?, municipality=?, province=?, status=?, slaapplaatsen=?, phone=?, email=?, website=?, type=?, regio=?, date_online=?, postal_code=? WHERE id=?");
-        let count = 0;
-        for (const row of rows) {
-          try {
-            const stored = JSON.parse(row.data);
-            const p = parseLodging(stored.raw || stored, stored.included || []);
-            upd.run(p.name||"", p.municipality||"", p.province||"", p.status||"", p.sleepPlaces||0, p.phone||"", p.email||"", p.website||"", p.type||"", p.toeristischeRegio||"", p.dateOnline||"", p.postalCode||"", row.id);
-            count++;
-          } catch(e) {}
-        }
-        saveDb();
-        console.log(`[migration] Backfill complete: ${count} rows`);
-      } catch(e) { console.error("[migration] Backfill error:", e.message); }
-    }, 3000);
-  }
+  // Backfill disabled - was OOM killing the container on 25k rows
+  // Municipality data comes from TV API included array per property
 
   ensureDefaultUsers();
   app.listen(PORT, () => {
