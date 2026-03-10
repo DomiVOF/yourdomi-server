@@ -1,15 +1,13 @@
 const express = require("express");
 const cors = require("cors");
-const initSqlJs = require("sql.js");
-const fs = require("fs");
+const initSqlJs = require('sql.js');
+const fs = require('fs');
 
 // sql.js wrapper that mimics better-sqlite3 API
 let _db = null;
 let _dbPath = null;
 
-function getDb() {
-  return _db;
-}
+function getDb() { return _db; }
 
 async function initDb(dbPath) {
   _dbPath = dbPath;
@@ -20,6 +18,7 @@ async function initDb(dbPath) {
   } else {
     _db = new SQL.Database();
   }
+  // Persist to disk after every write
   return _db;
 }
 
@@ -30,13 +29,13 @@ function saveDb() {
   }
 }
 
+// Minimal better-sqlite3 compatible wrapper
 class Statement {
-  constructor(db, sql) {
-    this.db = db;
-    this.sql = sql;
-  }
+  constructor(db, sql) { this.db = db; this.sql = sql; }
   run(...args) {
     this.db.run(this.sql, args.flat());
+    // Note: saveDb() is called explicitly after important mutations (login, outcomes, etc.)
+    // NOT here - would be called 25k times during backfill and kill performance
     return { changes: 1 };
   }
   get(...args) {
@@ -59,39 +58,34 @@ class Statement {
 }
 
 class Database {
-  constructor(db) {
-    this.db = db;
-  }
-  prepare(sql) {
-    return new Statement(this.db, sql);
-  }
-  exec(sql) {
-    this.db.run(sql);
-    saveDb();
-  }
+  constructor(db) { this.db = db; }
+  prepare(sql) { return new Statement(this.db, sql); }
+  exec(sql) { this.db.run(sql); saveDb(); }
   transaction(fn) {
     return (items) => {
-      fn(items);
+      fn(items); // no transaction wrapper - sql.js auto-commits
       saveDb();
     };
   }
 }
-
 const fetch = require("node-fetch");
 const cron = require("node-cron");
+const path = require("path");
 
-function lookupMunicipality() {
-  return null;
-}
+function lookupMunicipality() { return null; }
+
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || "*";
 const AI_STALE_DAYS = parseInt(process.env.AI_STALE_DAYS || "100");
 
+// -- DATABASE -----------------------------------------------------------------
 const DB_PATH = process.env.DB_PATH || "/data/yourdomi.db";
-let db;
+let db; // initialized async below
 
+// DB initialized in startServer()
 const DB_SCHEMA = `
   CREATE TABLE IF NOT EXISTS properties (
     id TEXT PRIMARY KEY,
@@ -146,7 +140,7 @@ const DB_SCHEMA = `
 `;
 
 const corsOptions = {
-  origin: function (origin, callback) {
+  origin: function(origin, callback) {
     callback(null, origin || "https://yourdomi-bellist.vercel.app");
   },
   credentials: true,
@@ -155,9 +149,10 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.options("*", cors(corsOptions)); // handle all preflight requests
 app.use(express.json({ limit: "2mb" }));
 
+// -- AUTH HELPERS --------------------------------------------------------------
 const crypto = require("crypto");
 
 function hashPassword(password) {
@@ -171,9 +166,7 @@ function generateToken() {
 function requireAuth(req, res, next) {
   const token = req.headers["x-auth-token"];
   if (!token) return res.status(401).json({ error: "Niet ingelogd" });
-  const session = db
-    .prepare("SELECT * FROM sessions WHERE token = ? AND expires_at > ?")
-    .get(token, Date.now());
+  const session = db.prepare("SELECT * FROM sessions WHERE token = ? AND expires_at > ?").get(token, Date.now());
   if (!session) return res.status(401).json({ error: "Sessie verlopen" });
   req.user = { id: session.user_id, username: session.username, name: session.name };
   next();
@@ -184,29 +177,30 @@ function ensureDefaultUsers() {
   const defaults = [
     { username: "aaron", name: "Aaron" },
     { username: "ruben", name: "Ruben" },
-    { username: "vic", name: "Vic" },
+    { username: "vic",   name: "Vic"   },
   ];
   for (const u of defaults) {
     const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(u.username);
     if (!existing) {
-      db.prepare(
-        "INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)",
-      ).run(u.username, hashPassword("yourdomi2026"), u.name, now);
+      db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?, ?, ?, ?)").run(
+        u.username, hashPassword("yourdomi2026"), u.name, now
+      );
+      console.log(`[auth] Created user: ${u.username}`);
     } else {
       db.prepare("UPDATE users SET password_hash = ?, name = ? WHERE username = ?").run(
-        hashPassword("yourdomi2026"),
-        u.name,
-        u.username,
+        hashPassword("yourdomi2026"), u.name, u.username
       );
+      console.log(`[auth] Updated user: ${u.username}`);
     }
   }
-  saveDb();
+  saveDb(); // persist user records so login works after restart
 }
 
+// -- TOERISME VLAANDEREN FETCH -------------------------------------------------
 const TV_BASE = "https://linked.toerismevlaanderen.be/lodgings";
 
 async function fetchPageFromTV(page = 1, size = 100) {
-  const url = `${TV_BASE}?page[size]=${size}&page[number]=${page}`;
+  const url = `https://linked.toerismevlaanderen.be/lodgings?page[size]=${size}&page[number]=${page}`;
   const res = await fetch(url, {
     headers: { Accept: "application/vnd.api+json", "User-Agent": "YourdomiServer/1.0" },
     signal: AbortSignal.timeout(60000),
@@ -215,177 +209,112 @@ async function fetchPageFromTV(page = 1, size = 100) {
   return res.json();
 }
 
-function pickIncludedForItem(raw, included) {
-  if (!Array.isArray(included) || !included.length) return [];
-
-  const wanted = new Set();
-  const rel = raw?.relationships || {};
-
-  const addRelData = (data) => {
-    if (!data) return;
-    if (Array.isArray(data)) {
-      for (const d of data) if (d?.type && d?.id) wanted.add(`${d.type}:${d.id}`);
-      return;
-    }
-    if (data?.type && data?.id) wanted.add(`${data.type}:${data.id}`);
-  };
-
-  addRelData(rel["contact-points"]?.data);
-  addRelData(rel.municipality?.data);
-  addRelData(rel.address?.data);
-  addRelData(rel.media?.data);
-  addRelData(rel["main-media"]?.data);
-
-  const byKey = new Map(included.map((i) => [`${i.type}:${i.id}`, i]));
-  for (const key of [...wanted]) {
-    const obj = byKey.get(key);
-    const provRef = obj?.relationships?.province?.data;
-    if (provRef?.type && provRef?.id) wanted.add(`${provRef.type}:${provRef.id}`);
-  }
-
-  return [...wanted].map((k) => byKey.get(k)).filter(Boolean);
-}
-
 async function syncPropertiesFromTV() {
   console.log("[sync] Starting fast parallel sync from Toerisme Vlaanderen...");
   const PAGE_SIZE = 100;
-  const CONCURRENCY = 8;
+  const CONCURRENCY = 8;  // parallel requests at once
   const now = Date.now();
 
-  const sqlVal = (v) => {
-    if (v === undefined || v === null) return null;
-    const t = typeof v;
-    if (t === "string" || t === "number") return v;
-    if (t === "boolean") return v ? 1 : 0;
-    return String(v);
-  };
-
   const insert = db.prepare(
-    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const insertMany = db.transaction((items) => {
     for (const item of items) {
       const parsed = parseLodging(item.raw, item.included);
       insert.run(
-        sqlVal(item.id),
-        sqlVal(JSON.stringify({ raw: item.raw, included: item.included })),
-        sqlVal(now),
-        sqlVal(parsed.name || ""),
-        sqlVal(parsed.municipality || ""),
-        sqlVal(parsed.province || ""),
-        sqlVal(parsed.status || ""),
-        sqlVal(parsed.slaapplaatsen || 0),
-        sqlVal(parsed.phone || ""),
-        sqlVal(parsed.email || ""),
-        sqlVal(parsed.website || ""),
-        sqlVal(parsed.type || ""),
-        sqlVal(parsed.toeristischeRegio || ""),
-        sqlVal(parsed.dateOnline || ""),
-        sqlVal(parsed.postalCode || ""),
+        item.id,
+        JSON.stringify(item),
+        now,
+        parsed.name || "",
+        parsed.municipality || "",
+        parsed.province || "",
+        parsed.status || "",
+        parsed.slaapplaatsen || 0,
+        parsed.phone || "",
+        parsed.email || "",
+        parsed.website || "",
+        parsed.type || "",
+        parsed.toeristischeRegio || "",
+        parsed.dateOnline || "",
+        parsed.postalCode || ""
       );
     }
   });
 
   try {
+    // Step 1: fetch page 1 to get total count
     const firstPage = await fetchPageFromTV(1, PAGE_SIZE);
     const total = firstPage.meta?.count || firstPage.meta?.total || 0;
-    if (!total) {
-      console.log("[sync] No properties found.");
-      return;
-    }
+    if (!total) { console.log("[sync] No properties found."); return; }
     const totalPages = Math.ceil(total / PAGE_SIZE);
-    console.log(
-      `[sync] Total: ${total} properties across ${totalPages} pages — ${CONCURRENCY} parallel`,
-    );
+    console.log(`[sync] Total: ${total} properties across ${totalPages} pages — ${CONCURRENCY} parallel`);
 
-    const firstIncluded = firstPage.included || [];
-    const firstItems = (firstPage.data || []).map((raw) => ({
-      id: raw.id,
-      raw,
-      included: pickIncludedForItem(raw, firstIncluded),
-    }));
+    // Store first page
+    const firstItems = (firstPage.data || []).map(item => ({ id: item.id, raw: item, included: firstPage.included || [] }));
     insertMany(firstItems);
     let synced = firstItems.length;
 
+    // Step 2: remaining pages in parallel batches
     const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
 
     for (let i = 0; i < remainingPages.length; i += CONCURRENCY) {
       const batch = remainingPages.slice(i, i + CONCURRENCY);
-      const results = await Promise.allSettled(batch.map((p) => fetchPageFromTV(p, PAGE_SIZE)));
+      const results = await Promise.allSettled(batch.map(p => fetchPageFromTV(p, PAGE_SIZE)));
 
       const toStore = [];
       for (let j = 0; j < results.length; j++) {
         const r = results[j];
         if (r.status === "fulfilled") {
-          const inc = r.value.included || [];
-          (r.value.data || []).forEach((raw) => {
-            toStore.push({ id: raw.id, raw, included: pickIncludedForItem(raw, inc) });
-          });
+          (r.value.data || []).forEach(item => toStore.push({ id: item.id, raw: item, included: r.value.included || [] }));
         } else {
-          const reasonText =
-            (r.reason && (r.reason.message || r.reason.stack || String(r.reason))) ||
-            "Unknown error";
-          console.warn(`[sync] Page ${batch[j]} failed: ${reasonText} — retrying`);
+          console.warn(`[sync] Page ${batch[j]} failed: ${r.reason?.message} — retrying`);
           try {
             const retry = await fetchPageFromTV(batch[j], PAGE_SIZE);
-            const inc = retry.included || [];
-            (retry.data || []).forEach((raw) => {
-              toStore.push({ id: raw.id, raw, included: pickIncludedForItem(raw, inc) });
-            });
-          } catch (e) {
-            console.error(
-              `[sync] Page ${batch[j]} retry failed: ${
-                e && (e.message || e.stack || String(e))
-              }`,
-            );
-          }
+            (retry.data || []).forEach(item => toStore.push({ id: item.id, raw: item, included: retry.included || [] }));
+          } catch(e) { console.error(`[sync] Page ${batch[j]} retry failed: ${e.message}`); }
         }
       }
 
       insertMany(toStore);
       synced += toStore.length;
-      const pct = Math.round((synced / total) * 100);
-      console.log(
-        `[sync] Pages ${batch[0]}-${batch[batch.length - 1]}: ${synced}/${total} (${pct}%)`,
-      );
+      const pct = Math.round(synced / total * 100);
+      console.log(`[sync] Pages ${batch[0]}-${batch[batch.length-1]}: ${synced}/${total} (${pct}%)`);
 
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 100)); // yield event loop between batches
     }
 
     console.log(`[sync] Done. Synced ${synced} properties.`);
   } catch (e) {
-    console.error(
-      "[sync] Error:",
-      e && (e.message || e.stack || String(e)) ? e.message || e.stack || String(e) : e,
-    );
+    console.error("[sync] Error:", e.message);
   }
 }
 
-const s = (v) =>
-  v && typeof v === "string" ? v : Array.isArray(v) ? v[0] || "" : v ? String(v) : "";
-const n = (v) => (isNaN(parseInt(v)) ? 0 : parseInt(v));
+// -- PARSE LODGING (same logic as frontend) -----------------------------------
+const s = (v) => (v && typeof v === "string") ? v : (Array.isArray(v) ? v[0] || "" : (v ? String(v) : ""));
+const n = (v) => isNaN(parseInt(v)) ? 0 : parseInt(v);
 
 function parseLodging(raw, included = []) {
   const attr = raw.attributes || {};
   const rel = raw.relationships || {};
 
-  let name = attr["name"] || attr["schema:name"] || `Pand ${String(raw.id || "").slice(-6)}`;
+  // Name — this is what we match against the Excel lookup
+  let name = attr["name"] || attr["schema:name"] || `Pand ${raw.id.slice(-6)}`;
 
+  // Municipality — use Excel lookup: primary by registration number (from URI), fallback by name
   const uri = attr["uri"] || attr["@id"] || "";
-  let municipality = "",
-    province = "",
-    postalCode = "",
-    toeristischeRegio = "";
+  let municipality = "", province = "", postalCode = "", toeristischeRegio = "";
 
   const luEntry = lookupMunicipality(name, uri);
   if (luEntry) {
-    if (!name || name.startsWith("Pand ")) name = luEntry[0] || name;
-    municipality = luEntry[1] || "";
-    province = luEntry[2] || "";
-    postalCode = luEntry[3] || "";
+    // luEntry: [name, municipality, province, postalCode, regio]
+    if (!name || name.startsWith("Pand ")) name = luEntry[0] || name; // use Excel name if TV API name empty
+    municipality      = luEntry[1] || "";
+    province          = luEntry[2] || "";
+    postalCode        = luEntry[3] || "";
     toeristischeRegio = luEntry[4] || "";
   }
 
+  // Fallback: try included (works when individual property is fetched)
   if (!municipality && included.length) {
     const muniRef = rel.municipality?.data || rel.address?.data;
     if (muniRef) {
@@ -401,50 +330,44 @@ function parseLodging(raw, included = []) {
     }
   }
 
+  // Contact — TV API uses contact-points relationship
   const contactPoints = rel["contact-points"]?.data || [];
-  const phones = [],
-    emails = [],
-    websites = [];
+  const phones = [], emails = [], websites = [];
   for (const cp of contactPoints) {
-    const c = included.find((i) => i.type === cp.type && i.id === cp.id);
+    const c = included.find(i => i.type === cp.type && i.id === cp.id);
     if (!c) continue;
     const ca = c.attributes || {};
     if (ca["schema:telephone"]) phones.push(s(ca["schema:telephone"]));
-    if (ca["schema:email"]) emails.push(s(ca["schema:email"]));
-    if (ca["schema:url"]) websites.push(s(ca["schema:url"]));
+    if (ca["schema:email"])     emails.push(s(ca["schema:email"]));
+    if (ca["schema:url"])       websites.push(s(ca["schema:url"]));
   }
+  // Also check direct attributes (older TV API format)
   if (!phones.length && attr["schema:telephone"]) phones.push(s(attr["schema:telephone"]));
-  if (!emails.length && attr["schema:email"]) emails.push(s(attr["schema:email"]));
-  if (!websites.length && attr["schema:url"]) websites.push(s(attr["schema:url"]));
+  if (!emails.length && attr["schema:email"])     emails.push(s(attr["schema:email"]));
+  if (!websites.length && attr["schema:url"])     websites.push(s(attr["schema:url"]));
 
-  const cleanPhone = (p) =>
-    s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
+  const cleanPhone = (p) => s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
   const phone = phones[0] ? cleanPhone(phones[0]) : null;
   const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
-  const mainMedia = rel["main-media"]?.data ? [rel["main-media"].data] : [];
-  const allMediaRefs = ([]).concat(rel.media?.data || [], mainMedia).filter(Boolean);
+  // Images
+  const mediaRefs = rel.media?.data || rel["main-media"]?.data ? [rel["main-media"]?.data].filter(Boolean) : [];
+  const allMediaRefs = (rel.media?.data || []).concat(mediaRefs).filter(Boolean);
   const images = allMediaRefs
-    .map((m) => included.find((i) => i.type === m.type && i.id === m.id)?.attributes?.contentUrl)
+    .map((m) => included.find(i => i.type === m.type && i.id === m.id)?.attributes?.contentUrl)
     .filter(Boolean)
     .slice(0, 5);
 
-  const slaapplaatsen = parseInt(
-    attr["number-of-sleeping-places"] ||
-      attr["number-of-sleep-places"] ||
-      attr["schema:numberOfRooms"] ||
-      0,
-  );
+  // Slaapplaatsen
+  const slaapplaatsen = parseInt(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0);
 
+  // Status
   const status = attr["registration-status"] || attr.status || "";
 
-  const type =
-    attr["category"] ||
-    attr["dcterms:type"] ||
-    attr["schema:additionalType"] ||
-    attr.type ||
-    "";
+  // Type
+  const type = attr["category"] || attr["dcterms:type"] || attr["schema:additionalType"] || attr.type || "";
 
+  // Date online
   const dateOnline = attr["modified"] || attr["registration-date"] || attr["dcterms:created"] || "";
 
   return {
@@ -456,18 +379,8 @@ function parseLodging(raw, included = []) {
     type: s(type),
     postalCode: s(postalCode),
     street: s(attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || ""),
-    sleepPlaces: n(
-      attr["number-of-sleeping-places"] ||
-        attr["number-of-sleep-places"] ||
-        attr["schema:numberOfRooms"] ||
-        0,
-    ),
-    slaapplaatsen: n(
-      attr["number-of-sleeping-places"] ||
-        attr["number-of-sleep-places"] ||
-        attr["schema:numberOfRooms"] ||
-        0,
-    ),
+    sleepPlaces: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
+    slaapplaatsen: n(attr["number-of-sleeping-places"] || attr["schema:numberOfRooms"] || 0),
     units: n(attr["number-of-rental-units"] || 1),
     phone: s(phone) || null,
     phoneNorm: s(phoneNorm) || null,
@@ -484,112 +397,117 @@ function parseLodging(raw, included = []) {
   };
 }
 
+// -- API ROUTES ----------------------------------------------------------------
+
+// GET /api/panden
 app.get("/api/panden", requireAuth, (req, res) => {
   try {
     const page = parseInt(req.query.page || "1");
     const size = Math.min(parseInt(req.query.size || "50"), 200);
-    const {
-      zoek,
-      gemeente,
-      provincie,
-      status,
-      minSlaap,
-      maxSlaap,
-      heeftTelefoon,
-      heeftEmail,
-      heeftWebsite,
-    } = req.query;
+    const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
 
     const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
     if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
 
+    // All filters use indexed columns only — no JSON_EXTRACT
     const conditions = [];
     const params = [];
 
     if (zoek) {
       const q = `%${zoek.toLowerCase()}%`;
-      conditions.push(
-        "(LOWER(name) LIKE ? OR LOWER(municipality) LIKE ? OR postal_code LIKE ?)",
-      );
+      conditions.push("(LOWER(name) LIKE ? OR LOWER(municipality) LIKE ? OR postal_code LIKE ?)");
       params.push(q, q, `%${zoek}%`);
     }
     if (gemeente) {
       conditions.push("LOWER(municipality) LIKE ?");
       params.push(`%${gemeente.toLowerCase()}%`);
     }
-    if (provincie) {
-      conditions.push("province = ?");
-      params.push(provincie);
-    }
-    if (status) {
-      conditions.push("status = ?");
-      params.push(status);
-    }
-    if (minSlaap) {
-      conditions.push("slaapplaatsen >= ?");
-      params.push(parseInt(minSlaap));
-    }
-    if (maxSlaap) {
-      conditions.push("slaapplaatsen <= ?");
-      params.push(parseInt(maxSlaap));
-    }
-    if (req.query.type) {
-      conditions.push("type = ?");
-      params.push(req.query.type);
-    }
-    if (req.query.regio) {
-      conditions.push("regio = ?");
-      params.push(req.query.regio);
-    }
-    if (heeftTelefoon === "1") {
-      conditions.push("phone != '' AND phone IS NOT NULL");
-    }
-    if (heeftEmail === "1") {
-      conditions.push("email != '' AND email IS NOT NULL");
-    }
-    if (heeftWebsite === "1") {
-      conditions.push("website != '' AND website IS NOT NULL");
-    }
+    if (provincie) { conditions.push("province = ?"); params.push(provincie); }
+    if (status)    { conditions.push("status = ?");   params.push(status); }
+    if (minSlaap)  { conditions.push("slaapplaatsen >= ?"); params.push(parseInt(minSlaap)); }
+    if (maxSlaap)  { conditions.push("slaapplaatsen <= ?"); params.push(parseInt(maxSlaap)); }
+    if (req.query.type)  { conditions.push("type = ?");  params.push(req.query.type); }
+    if (req.query.regio) { conditions.push("regio = ?"); params.push(req.query.regio); }
+    if (heeftTelefoon === "1") { conditions.push("phone != '' AND phone IS NOT NULL"); }
+    if (heeftEmail    === "1") { conditions.push("email != '' AND email IS NOT NULL"); }
+    if (heeftWebsite  === "1") { conditions.push("website != '' AND website IS NOT NULL"); }
 
-    const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+    const where   = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
     const orderBy = req.query.sorteer === "nieuwste" ? "ORDER BY date_online DESC" : "";
 
-    const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(
-      ...params,
-    ).c;
+    const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
     const offset = (page - 1) * size;
-    const rows = db
-      .prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`)
-      .all(...params, size, offset);
+    const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
 
-    const properties = rows
-      .map((r) => {
-        try {
-          const stored = JSON.parse(r.data);
-          return parseLodging(stored.raw || stored, stored.included || []);
-        } catch (e) {
-          console.error("[panden] parseLodging error:", e && (e.message || e.stack || String(e)));
-          return null;
-        }
-      })
-      .filter(Boolean);
+    const properties = rows.map(r => {
+      try {
+        const stored = JSON.parse(r.data);
+        return parseLodging(stored.raw || stored, stored.included || []);
+      } catch(e) {
+        console.error("[panden] parseLodging error:", e.message);
+        return null;
+      }
+    }).filter(Boolean);
 
     res.json({
       data: properties,
       meta: { total: filteredTotal, dbTotal: total, page, size, pages: Math.ceil(filteredTotal / size) },
     });
   } catch (e) {
-    console.error("[/api/panden] error:", e && (e.message || e.stack || String(e)));
-    res.status(500).json({ error: e && (e.message || String(e)) });
+    console.error("[/api/panden] error:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
+// GET /api/panden/count
 app.get("/api/panden/count", requireAuth, (req, res) => {
   const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
   res.json({ total, lastFetch });
 });
 
+// GET /api/debug — NO AUTH — shows raw stored data so we can fix field names
+app.get("/api/debug", (req, res) => {
+  try {
+    const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+    const emptyMuni = db.prepare("SELECT COUNT(*) as c FROM properties WHERE municipality IS NULL OR municipality = ''").get().c;
+    const filledMuni = total - emptyMuni;
+
+    // Show raw attributes of first 3 properties — this tells us the exact TV API field names
+    const rawRows = db.prepare("SELECT data FROM properties LIMIT 3").all();
+    const rawSamples = rawRows.map(r => {
+      const stored = JSON.parse(r.data);
+      const raw = stored.raw || stored;
+      const attr = raw.attributes || {};
+      return {
+        id: raw.id,
+        allAttributeKeys: Object.keys(attr),
+        schemaAddress: attr["schema:address"] || null,
+        relationshipKeys: Object.keys(raw.relationships || {}),
+        includedCount: (stored.included || []).length,
+        includedTypes: [...new Set((stored.included || []).map(i => i.type))],
+        firstIncluded: (stored.included || [])[0] || null,
+        // Show all values for key candidates
+        "attr.hoofdgemeente": attr["hoofdgemeente"],
+        "attr.municipality-name": attr["municipality-name"],
+        "attr.address-municipality": attr["address-municipality"],
+        "attr.schema:address": attr["schema:address"],
+        "rel.municipality": raw.relationships?.municipality || null,
+      };
+    });
+
+    // Also test: does gemeente filter return anything?
+    const testGent = db.prepare("SELECT COUNT(*) as c FROM properties WHERE LOWER(municipality) LIKE '%gent%'").get().c;
+    const testKoksijde = db.prepare("SELECT COUNT(*) as c FROM properties WHERE LOWER(municipality) LIKE '%koksijde%'").get().c;
+    const sampleMunicipalities = db.prepare("SELECT municipality, COUNT(*) as c FROM properties WHERE municipality != '' GROUP BY municipality ORDER BY c DESC LIMIT 20").all();
+
+    res.json({ total, filledMuni, emptyMuni, testGent, testKoksijde, sampleMunicipalities, rawSamples });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST or GET /api/sync - trigger manual sync
 app.post("/api/sync", async (req, res) => {
   res.json({ ok: true, message: "Sync started in background" });
   syncPropertiesFromTV().catch(console.error);
@@ -599,6 +517,14 @@ app.get("/api/sync", async (req, res) => {
   syncPropertiesFromTV().catch(console.error);
 });
 
+// GET /api/enrichment/:id
+app.get("/api/enrichment/:id", requireAuth, (req, res) => {
+  const row = db.prepare("SELECT data, enriched_at FROM enrichment WHERE id = ?").get(req.params.id);
+  if (!row) return res.json(null);
+  res.json({ ...JSON.parse(row.data), _enrichedAt: row.enriched_at });
+});
+
+// GET /api/enrichment - get all (for bulk load)
 app.get("/api/enrichment", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT id, data, enriched_at FROM enrichment").all();
   const result = {};
@@ -608,18 +534,32 @@ app.get("/api/enrichment", requireAuth, (req, res) => {
   res.json(result);
 });
 
+// POST /api/enrichment/:id - save enrichment result
 app.post("/api/enrichment/:id", requireAuth, (req, res) => {
   const data = req.body;
   if (!data || typeof data !== "object") return res.status(400).json({ error: "Invalid data" });
   db.prepare("INSERT OR REPLACE INTO enrichment (id, data, enriched_at) VALUES (?, ?, ?)").run(
     req.params.id,
     JSON.stringify(data),
-    Date.now(),
+    Date.now()
   );
   saveDb();
   res.json({ ok: true });
 });
 
+// GET /api/enrichment/stale - get IDs that need re-enrichment
+app.get("/api/enrichment/stale", requireAuth, (req, res) => {
+  const cutoff = Date.now() - AI_STALE_DAYS * 24 * 60 * 60 * 1000;
+  // Properties with no enrichment or enrichment older than AI_STALE_DAYS
+  const staleRows = db.prepare("SELECT id FROM enrichment WHERE enriched_at < ?").all(cutoff);
+  const enrichedIds = new Set(db.prepare("SELECT id FROM enrichment").all().map((r) => r.id));
+  const allIds = db.prepare("SELECT id FROM properties").all().map((r) => r.id);
+  const unenriched = allIds.filter((id) => !enrichedIds.has(id));
+  const stale = staleRows.map((r) => r.id);
+  res.json({ stale: [...stale, ...unenriched].slice(0, 200) });
+});
+
+// GET /api/outcomes - all outcomes + notes
 app.get("/api/outcomes", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT * FROM outcomes").all();
   const result = {};
@@ -634,15 +574,17 @@ app.get("/api/outcomes", requireAuth, (req, res) => {
   res.json(result);
 });
 
+// POST /api/outcomes/:id
 app.post("/api/outcomes/:id", requireAuth, (req, res) => {
   const { outcome, note, contactNaam } = req.body;
   db.prepare(
-    "INSERT OR REPLACE INTO outcomes (id, outcome, note, contact_naam, updated_at) VALUES (?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO outcomes (id, outcome, note, contact_naam, updated_at) VALUES (?, ?, ?, ?, ?)"
   ).run(req.params.id, outcome || null, note || null, contactNaam || null, Date.now());
   saveDb();
   res.json({ ok: true });
 });
 
+// GET /api/health
 app.get("/api/health", requireAuth, (req, res) => {
   const propCount = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
   const enrichCount = db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c;
@@ -658,7 +600,7 @@ app.get("/api/health", requireAuth, (req, res) => {
   });
 });
 
-// meta info for filters
+// GET /api/meta - unique provinces, types for filter dropdowns
 app.get("/api/meta", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT data FROM properties").all();
   const provinces = new Set();
@@ -680,22 +622,42 @@ app.get("/api/meta", requireAuth, (req, res) => {
   });
 });
 
+// -- CRON: weekly property sync, daily stale re-enrichment check ---------------
+// Every Sunday at 03:00 - re-sync all properties from TV
+cron.schedule("0 3 * * 0", () => {
+  console.log("[cron] Weekly property sync starting...");
+  syncPropertiesFromTV().catch(console.error);
+});
+
+// -- AUTH ENDPOINTS -----------------------------------------------------------
+// Emergency reset - only works if ADMIN_PASSWORD env var is set in Railway
+app.post("/api/admin/reset-password", (req, res) => {
+  const adminPw = process.env.ADMIN_PASSWORD;
+  if (!adminPw) return res.status(403).json({ error: "ADMIN_PASSWORD not configured" });
+  const { adminPassword, username, newPassword } = req.body;
+  if (adminPassword !== adminPw) return res.status(403).json({ error: "Wrong admin password" });
+  if (!username || !newPassword) return res.status(400).json({ error: "username and newPassword required" });
+  const user = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  db.prepare("UPDATE users SET password_hash = ? WHERE username = ?").run(hashPassword(newPassword), username);
+  db.prepare("DELETE FROM sessions WHERE username = ?").run(username); // invalidate old sessions
+  res.json({ ok: true, message: `Password reset for ${username}` });
+});
+
+
 app.post("/api/login", (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password)
-    return res.status(400).json({ error: "Gebruikersnaam en wachtwoord vereist" });
-  const user = db
-    .prepare("SELECT * FROM users WHERE username = ?")
-    .get(username.toLowerCase().trim());
+  if (!username || !password) return res.status(400).json({ error: "Gebruikersnaam en wachtwoord vereist" });
+  const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username.toLowerCase().trim());
   if (!user || user.password_hash !== hashPassword(password)) {
     return res.status(401).json({ error: "Ongeldige gebruikersnaam of wachtwoord" });
   }
   const token = generateToken();
   const now = Date.now();
-  const expires = now + 30 * 24 * 60 * 60 * 1000;
-  db.prepare(
-    "INSERT INTO sessions (token, user_id, username, name, created_at, expires_at) VALUES (?,?,?,?,?,?)",
-  ).run(token, user.id, user.username, user.name || user.username, now, expires);
+  const expires = now + 30 * 24 * 60 * 60 * 1000; // 30 days
+  db.prepare("INSERT INTO sessions (token, user_id, username, name, created_at, expires_at) VALUES (?,?,?,?,?,?)").run(
+    token, user.id, user.username, user.name || user.username, now, expires
+  );
   saveDb();
   res.json({ token, username: user.username, name: user.name || user.username });
 });
@@ -720,27 +682,30 @@ app.post("/api/users", requireAuth, (req, res) => {
   if (!username || !password) return res.status(400).json({ error: "username en password vereist" });
   try {
     db.prepare("INSERT INTO users (username, password_hash, name, created_at) VALUES (?,?,?,?)").run(
-      username.toLowerCase().trim(),
-      hashPassword(password),
-      name || username,
-      Date.now(),
+      username.toLowerCase().trim(), hashPassword(password), name || username, Date.now()
     );
     res.json({ ok: true });
-  } catch (e) {
+  } catch(e) {
     res.status(400).json({ error: "Gebruikersnaam bestaat al" });
   }
+});
+
+app.delete("/api/users/:username", requireAuth, (req, res) => {
+  db.prepare("DELETE FROM users WHERE username = ?").run(req.params.username);
+  res.json({ ok: true });
 });
 
 app.post("/api/users/:username/password", requireAuth, (req, res) => {
   const { password } = req.body;
   if (!password) return res.status(400).json({ error: "password vereist" });
   db.prepare("UPDATE users SET password_hash = ? WHERE username = ?").run(
-    hashPassword(password),
-    req.params.username,
+    hashPassword(password), req.params.username
   );
   res.json({ ok: true });
 });
 
+// -- MONDAY PROXY -------------------------------------------------------------
+// Browser can't call Monday API directly (CORS). Proxy it through the server.
 app.post("/api/ai", requireAuth, async (req, res) => {
   const apiKey = ANTHROPIC_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_KEY not configured on server" });
@@ -757,7 +722,7 @@ app.post("/api/ai", requireAuth, async (req, res) => {
     const data = await r.json();
     res.json(data);
   } catch (e) {
-    res.status(500).json({ error: e && (e.message || String(e)) });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -771,7 +736,7 @@ app.post("/api/monday", requireAuth, async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: apiKey,
+        "Authorization": apiKey,
         "API-Version": "2024-01",
       },
       body: JSON.stringify({ query, variables: variables || {} }),
@@ -779,21 +744,18 @@ app.post("/api/monday", requireAuth, async (req, res) => {
     const data = await r.json();
     res.json(data);
   } catch (e) {
-    res.status(500).json({ error: e && (e.message || String(e)) });
+    res.status(500).json({ error: e.message });
   }
 });
 
-cron.schedule("0 3 * * 0", () => {
-  console.log("[cron] Weekly property sync starting...");
-  syncPropertiesFromTV().catch(console.error);
-});
-
+// -- START ---------------------------------------------------------------------
 async function startServer() {
   const sqlDb = await initDb(DB_PATH);
   db = new Database(sqlDb);
   db.exec(DB_SCHEMA);
 
-  const existingCols = db.prepare("PRAGMA table_info(properties)").all().map((r) => r.name);
+  // Migrations: add columns to existing tables if they don't exist yet
+  const existingCols = db.prepare("PRAGMA table_info(properties)").all().map(r => r.name);
   const newCols = [
     ["name", "TEXT"],
     ["municipality", "TEXT"],
@@ -811,12 +773,17 @@ async function startServer() {
   for (const [col, type] of newCols) {
     if (!existingCols.includes(col)) {
       db.exec(`ALTER TABLE properties ADD COLUMN ${col} ${type}`);
+      console.log(`[migration] Added column: ${col}`);
     }
   }
+  // Create indexes now that columns are guaranteed to exist
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_name ON properties(name)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_municipality ON properties(municipality)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_province ON properties(province)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_props_status ON properties(status)`);
+
+  // Backfill disabled - was OOM killing the container on 25k rows
+  // Municipality data comes from TV API included array per property
 
   ensureDefaultUsers();
   app.listen(PORT, () => {
