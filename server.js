@@ -34,6 +34,7 @@ class Statement {
   constructor(db, sql) { this.db = db; this.sql = sql; }
   run(...args) {
     this.db.run(this.sql, args.flat());
+    saveDb();
     return { changes: 1 };
   }
   get(...args) {
