@@ -70,40 +70,8 @@ const fetch = require("node-fetch");
 const cron = require("node-cron");
 const path = require("path");
 
-// Load municipality lookup from Excel-derived JSON
-// Format: { by_name: { "name lowercase": [...] }, by_regnr: { "211202": [...] } }
-let MUNI_LOOKUP = { by_name: {}, by_regnr: {} };
-try {
-  const muniPath = path.join(__dirname, "municipalities.json");
-  const raw = JSON.parse(require("fs").readFileSync(muniPath, "utf-8"));
-  // Support both old flat format and new {by_name, by_regnr} format
-  if (raw.by_name) {
-    MUNI_LOOKUP = raw;
-  } else {
-    MUNI_LOOKUP = { by_name: raw, by_regnr: {} };
-  }
-  console.log(`[municipalities] Loaded ${Object.keys(MUNI_LOOKUP.by_name).length} name + ${Object.keys(MUNI_LOOKUP.by_regnr).length} regnr entries`);
-} catch(e) {
-  console.warn("[municipalities] Could not load municipalities.json:", e.message);
-}
+function lookupMunicipality() { return null; }
 
-function lookupMunicipality(name, uri) {
-  // Primary: match by registration number extracted from URI
-  if (uri && typeof uri === "string") {
-    const m = uri.match(/\/lodgings\/(\d+)/);
-    if (m) {
-      const entry = MUNI_LOOKUP.by_regnr[m[1]];
-      if (entry) return entry;
-    }
-  }
-  // Fallback: match by normalized name
-  if (name && typeof name === "string") {
-    const key = name.toLowerCase().trim().replace(/^['"\s]+|['"\s]+$/g, "").replace(/\s+/g, " ");
-    const entry = MUNI_LOOKUP.by_name[key];
-    if (entry) return entry;
-  }
-  return null;
-}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -366,18 +334,18 @@ function parseLodging(raw, included = []) {
     const c = included.find(i => i.type === cp.type && i.id === cp.id);
     if (!c) continue;
     const ca = c.attributes || {};
-    if (ca["schema:telephone"]) phones.push(ca["schema:telephone"]);
-    if (ca["schema:email"])     emails.push(ca["schema:email"]);
-    if (ca["schema:url"])       websites.push(ca["schema:url"]);
+    if (ca["schema:telephone"]) phones.push(s(ca["schema:telephone"]));
+    if (ca["schema:email"])     emails.push(s(ca["schema:email"]));
+    if (ca["schema:url"])       websites.push(s(ca["schema:url"]));
   }
   // Also check direct attributes (older TV API format)
-  if (!phones.length && attr["schema:telephone"]) phones.push(attr["schema:telephone"]);
-  if (!emails.length && attr["schema:email"])     emails.push(attr["schema:email"]);
-  if (!websites.length && attr["schema:url"])     websites.push(attr["schema:url"]);
+  if (!phones.length && attr["schema:telephone"]) phones.push(s(attr["schema:telephone"]));
+  if (!emails.length && attr["schema:email"])     emails.push(s(attr["schema:email"]));
+  if (!websites.length && attr["schema:url"])     websites.push(s(attr["schema:url"]));
 
-  const cleanPhone = (p) => p?.replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32") || "";
-  const phone = phones[0] ? cleanPhone(phones[0]) : "";
-  const phoneNorm = phone.replace(/[^0-9+]/g, "");
+  const cleanPhone = (p) => s(p).replace(/\s/g, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
+  const phone = phones[0] ? cleanPhone(phones[0]) : null;
+  const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
   // Images
   const mediaRefs = rel.media?.data || rel["main-media"]?.data ? [rel["main-media"]?.data].filter(Boolean) : [];
