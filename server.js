@@ -58,7 +58,8 @@ const DB_SCHEMA = `
     regio       TEXT,
     date_online TEXT,
     postal_code TEXT,
-    street      TEXT
+    street      TEXT,
+    phone2      TEXT
   );
 
   CREATE TABLE IF NOT EXISTS enrichment (
@@ -412,11 +413,14 @@ async function syncPropertiesFromTV() {
   };
 
   const insert = db.prepare(
-    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code, street) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, phone2, email, website, type, regio, date_online, postal_code, street) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
   const insertMany = db.transaction((items) => {
     for (const item of items) {
       const parsed = parseLodging(item.raw, item.included);
+      if (!parsed.municipality || String(parsed.municipality).trim() === "") continue;
+      if (!parsed.phone || String(parsed.phone).trim() === "") continue;
+      if (isExcludedType(parsed.type)) continue;
       insert.run(
         sqlVal(item.id),
         sqlVal(JSON.stringify({ raw: item.raw, included: item.included })),
@@ -427,6 +431,7 @@ async function syncPropertiesFromTV() {
         sqlVal(parsed.status || ""),
         sqlVal(parsed.slaapplaatsen || 0),
         sqlVal(parsed.phone || ""),
+        sqlVal(parsed.phone2 || ""),
         sqlVal(parsed.email || ""),
         sqlVal(parsed.website || ""),
         sqlVal(parsed.type || ""),
@@ -651,6 +656,7 @@ function parseLodging(raw, included = []) {
   const cleanPhone = (p) =>
     s(p).replace(/\s/g, "").replace(/^tel:/i, "").replace(/^00/, "+").replace(/^\+?0032/, "+32");
   const phone = phones[0] ? cleanPhone(phones[0]) : null;
+  const phone2 = phones[1] ? cleanPhone(phones[1]) : null;
   const phoneNorm = phone ? phone.replace(/[^0-9+]/g, "") : null;
 
   const mainMedia = rel["main-media"]?.data ? [rel["main-media"].data] : [];
@@ -690,6 +696,7 @@ function parseLodging(raw, included = []) {
     ),
     units: n(attr["number-of-rental-units"] || 1),
     phone: s(phone) || null,
+    phone2: s(phone2) || null,
     phoneNorm: s(phoneNorm) || null,
     email: s(emails[0]) || null,
     website: s(websites[0]) || null,
@@ -704,6 +711,27 @@ function parseLodging(raw, included = []) {
   };
 }
 
+const HAS_CITY = " (municipality IS NOT NULL AND TRIM(COALESCE(municipality,'')) != '') ";
+const HAS_PHONE = " (phone IS NOT NULL AND TRIM(COALESCE(phone,'')) != '') ";
+const HAS_CITY_AND_PHONE = HAS_CITY + " AND " + HAS_PHONE;
+
+// Alleen vakantiewoningen: geen B&B, terrein gebonden, camping, hostel, jeugdverblijf, camperterrein
+const EXCLUDED_TYPE_PATTERNS = [
+  "b&b", "bed and breakfast", "terrein gebonden", "camping", "hostel",
+  "jeugdverblijf", "camperterrein", "jeugdherberg", "groepsaccommodatie",
+];
+function isExcludedType(typeStr) {
+  if (!typeStr || typeof typeStr !== "string") return false;
+  const lower = typeStr.toLowerCase().trim();
+  return EXCLUDED_TYPE_PATTERNS.some((p) => lower.includes(p));
+}
+function sqlNotExcludedType() {
+  const conditions = EXCLUDED_TYPE_PATTERNS.map(
+    (p) => `(LOWER(TRIM(COALESCE(type,'')) NOT LIKE '%' || ? || '%')`
+  );
+  return " ( " + conditions.join(" AND ") + " ) ";
+}
+
 // GET /api/panden — disable cache so client always gets fresh data (avoids 304 with stale/empty body)
 app.get("/api/panden", requireAuth, (req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
@@ -712,11 +740,14 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const size = Math.min(parseInt(req.query.size || "50"), 200);
     const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
 
-    const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+    const totalRow = db.prepare(
+      `SELECT COUNT(*) as c FROM properties WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`
+    ).get(...EXCLUDED_TYPE_PATTERNS);
+    const total = totalRow?.c ?? 0;
     if (total === 0) return res.json({ data: [], meta: { total: 0, page, size }, _needsSync: true });
 
-    const conditions = [];
-    const params = [];
+    const conditions = [HAS_CITY_AND_PHONE, sqlNotExcludedType()];
+    const params = [...EXCLUDED_TYPE_PATTERNS];
 
     if (zoek) {
       const q = `%${zoek.toLowerCase()}%`;
@@ -734,7 +765,7 @@ app.get("/api/panden", requireAuth, (req, res) => {
     if (heeftEmail    === "1") conditions.push("email IS NOT NULL AND email != ''");
     if (heeftWebsite  === "1") conditions.push("website IS NOT NULL AND website != ''");
 
-    const where   = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+    const where   = "WHERE " + conditions.join(" AND ");
     const sortMap = {
       nieuwste: "ORDER BY date_online DESC",
       oudste: "ORDER BY date_online ASC",
@@ -752,9 +783,11 @@ app.get("/api/panden", requireAuth, (req, res) => {
 
     const filteredTotal = db.prepare(`SELECT COUNT(*) as c FROM properties ${where}`).get(...params).c;
     const offset = (page - 1) * size;
-    const rows = db.prepare(
-      `SELECT id, data, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code, street FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`
-    ).all(...params, size, offset);
+    const rows = db
+      .prepare(
+        `SELECT id, data, name, municipality, province, status, slaapplaatsen, phone, phone2, email, website, type, regio, date_online, postal_code, street FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`
+      )
+      .all(...params, size, offset);
 
     const properties = rows.map(r => {
       try {
@@ -776,6 +809,7 @@ app.get("/api/panden", requireAuth, (req, res) => {
         sleepPlaces: r.slaapplaatsen || 0,
         units: 1,
         phone: r.phone || null,
+        phone2: r.phone2 || null,
         email: r.email || null,
         website: r.website || null,
         type: r.type || "",
@@ -806,7 +840,10 @@ app.get("/api/panden", requireAuth, (req, res) => {
 
 // GET /api/panden/count
 app.get("/api/panden/count", requireAuth, (req, res) => {
-  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  const row = db
+    .prepare(`SELECT COUNT(*) as c FROM properties WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`)
+    .get(...EXCLUDED_TYPE_PATTERNS);
+  const total = row?.c ?? 0;
   const lastFetch = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get().t;
   res.json({ total, lastFetch });
 });
@@ -820,15 +857,17 @@ app.post("/api/panden/enrich-address", requireAuth, (req, res) => {
 // API ROUTES — META
 // =============================================================================
 
-// GET /api/meta — facetwaarden voor Power BI–achtige filters (dropdowns, sort)
+// GET /api/meta — facetwaarden; alleen vakantiewoningen met stad en telefoon
 app.get("/api/meta", requireAuth, (req, res) => {
-  const provinces = db.prepare("SELECT DISTINCT province FROM properties WHERE province IS NOT NULL AND province != '' ORDER BY province").all().map(r => r.province);
-  const municipalities = db.prepare("SELECT DISTINCT municipality FROM properties WHERE municipality IS NOT NULL AND municipality != '' ORDER BY municipality").all().map(r => r.municipality);
-  const types = db.prepare("SELECT DISTINCT type FROM properties WHERE type IS NOT NULL AND type != '' ORDER BY type").all().map(r => r.type);
-  const regios = db.prepare("SELECT DISTINCT regio FROM properties WHERE regio IS NOT NULL AND regio != '' ORDER BY regio").all().map(r => r.regio);
-  const statuses = db.prepare("SELECT DISTINCT status FROM properties WHERE status IS NOT NULL AND status != '' ORDER BY status").all().map(r => r.status);
-  const slaapRange = db.prepare("SELECT MIN(slaapplaatsen) as minSlaap, MAX(slaapplaatsen) as maxSlaap FROM properties WHERE slaapplaatsen IS NOT NULL").get();
-  const total = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  const baseWhere = `WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`;
+  const baseParams = [...EXCLUDED_TYPE_PATTERNS];
+  const provinces = db.prepare(`SELECT DISTINCT province FROM properties ${baseWhere} AND province IS NOT NULL AND province != '' ORDER BY province`).all(...baseParams).map(r => r.province);
+  const municipalities = db.prepare(`SELECT DISTINCT municipality FROM properties ${baseWhere} AND municipality IS NOT NULL AND municipality != '' ORDER BY municipality`).all(...baseParams).map(r => r.municipality);
+  const types = db.prepare(`SELECT DISTINCT type FROM properties ${baseWhere} AND type IS NOT NULL AND type != '' ORDER BY type`).all(...baseParams).map(r => r.type);
+  const regios = db.prepare(`SELECT DISTINCT regio FROM properties ${baseWhere} AND regio IS NOT NULL AND regio != '' ORDER BY regio`).all(...baseParams).map(r => r.regio);
+  const statuses = db.prepare(`SELECT DISTINCT status FROM properties ${baseWhere} AND status IS NOT NULL AND status != '' ORDER BY status`).all(...baseParams).map(r => r.status);
+  const slaapRange = db.prepare(`SELECT MIN(slaapplaatsen) as minSlaap, MAX(slaapplaatsen) as maxSlaap FROM properties ${baseWhere} AND slaapplaatsen IS NOT NULL`).get(...baseParams);
+  const total = db.prepare(`SELECT COUNT(*) as c FROM properties ${baseWhere}`).get(...baseParams).c;
   res.json({
     provinces,
     municipalities,
@@ -855,11 +894,11 @@ app.get("/api/meta", requireAuth, (req, res) => {
 
 // GET /api/health
 app.get("/api/health", requireAuth, (req, res) => {
-  const props    = db.prepare("SELECT COUNT(*) as c FROM properties").get().c;
+  const props = db.prepare(`SELECT COUNT(*) as c FROM properties WHERE ${HAS_CITY_AND_PHONE} AND ${sqlNotExcludedType()}`).get(...EXCLUDED_TYPE_PATTERNS)?.c ?? 0;
   const enriched = db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c;
   const outcomes = db.prepare("SELECT COUNT(*) as c FROM outcomes").get().c;
   const lastSync = db.prepare("SELECT MAX(fetched_at) as t FROM properties").get()?.t;
-  const withPhone = db.prepare("SELECT COUNT(*) as c FROM properties WHERE phone IS NOT NULL AND phone != ''").get().c;
+  const withPhone = props;
   res.json({
     ok: true, properties: props, enrichments: enriched, outcomes,
     withPhone, lastSync: lastSync ? new Date(lastSync).toISOString() : null,
@@ -896,7 +935,7 @@ app.post("/api/backfill", requireAuth, (req, res) => {
     try {
       const rows = db.prepare("SELECT id, data FROM properties").all();
       const upd = db.prepare(
-        "UPDATE properties SET name=?,municipality=?,province=?,status=?,slaapplaatsen=?,phone=?,email=?,website=?,type=?,regio=?,date_online=?,postal_code=?,street=? WHERE id=?"
+        "UPDATE properties SET name=?,municipality=?,province=?,status=?,slaapplaatsen=?,phone=?,phone2=?,email=?,website=?,type=?,regio=?,date_online=?,postal_code=?,street=? WHERE id=?"
       );
       let n = 0;
       for (const row of rows) {
@@ -905,7 +944,7 @@ app.post("/api/backfill", requireAuth, (req, res) => {
           const parsed = p.raw && Array.isArray(p.included) ? parseLodging(p.raw, p.included) : p;
           upd.run(
             parsed.name ?? "", parsed.municipality ?? "", parsed.province ?? "", parsed.status ?? "",
-            parsed.slaapplaatsen ?? 0, parsed.phone ?? "", parsed.email ?? "", parsed.website ?? "",
+            parsed.slaapplaatsen ?? 0, parsed.phone ?? "", parsed.phone2 ?? "", parsed.email ?? "", parsed.website ?? "",
             parsed.type ?? "", parsed.toeristischeRegio ?? "", parsed.dateOnline ?? "", parsed.postalCode ?? "", parsed.street ?? "",
             row.id
           );
@@ -942,6 +981,29 @@ app.post("/api/admin/reset-db", requireAuth, (req, res) => {
       ok: true,
       message: "Database gereset. Run nu ‘Sync TV-data nu’ om opnieuw te vullen.",
       deletedProperties: p,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/remove-no-city — ruim DB op: verwijder zonder stad/telefoon én niet-vakantiewoningen (B&B, terrein gebonden, camping, etc.)
+app.post("/api/admin/remove-no-city", requireAuth, (req, res) => {
+  try {
+    const incomplete =
+      " (municipality IS NULL OR TRIM(COALESCE(municipality,'')) = '' OR phone IS NULL OR TRIM(COALESCE(phone,'')) = '') ";
+    const excludedTypeSql = EXCLUDED_TYPE_PATTERNS.map(
+      (p) => `LOWER(TRIM(COALESCE(type,''))) LIKE '%' || '${String(p).replace(/'/g, "''")}' || '%'`
+    ).join(" OR ");
+    const toDelete = ` (${incomplete} OR (${excludedTypeSql})) `;
+    db.prepare(`DELETE FROM enrichment WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
+    db.prepare(`DELETE FROM outcomes WHERE id IN (SELECT id FROM properties WHERE ${toDelete})`).run();
+    const deleted = db.prepare(`DELETE FROM properties WHERE ${toDelete}`).run();
+    console.log("[admin] Cleanup: removed", deleted.changes, "properties (no city/phone or excluded type).");
+    res.json({
+      ok: true,
+      message: "Opgeruimd: panden zonder stad/telefoon en niet-vakantiewoningen (B&B, terrein gebonden, camping, etc.) verwijderd. Vrijgekomen ruimte op Railway.",
+      deleted: deleted.changes,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1180,7 +1242,7 @@ async function startServer() {
   const cols = db.prepare("PRAGMA table_info(properties)").all().map(r => r.name);
   for (const [col, type] of [
     ["name","TEXT"],["municipality","TEXT"],["province","TEXT"],["status","TEXT"],
-    ["slaapplaatsen","INTEGER"],["phone","TEXT"],["email","TEXT"],["website","TEXT"],
+    ["slaapplaatsen","INTEGER"],["phone","TEXT"],["phone2","TEXT"],["email","TEXT"],["website","TEXT"],
     ["type","TEXT"],["regio","TEXT"],["date_online","TEXT"],["postal_code","TEXT"],["street","TEXT"],
   ]) {
     if (!cols.includes(col)) {
