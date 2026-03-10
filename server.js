@@ -389,7 +389,7 @@ async function syncPropertiesFromTV() {
   };
 
   const insert = db.prepare(
-    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO properties (id, data, fetched_at, name, municipality, province, status, slaapplaatsen, phone, email, website, type, regio, date_online, postal_code, street) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
   const insertMany = db.transaction((items) => {
     for (const item of items) {
@@ -410,6 +410,7 @@ async function syncPropertiesFromTV() {
         sqlVal(parsed.toeristischeRegio || ""),
         sqlVal(parsed.dateOnline || ""),
         sqlVal(parsed.postalCode || ""),
+        sqlVal(parsed.street || ""),
       );
     }
   });
@@ -529,6 +530,20 @@ function parseLodging(raw, included = []) {
     }
   }
 
+  // Address from main resource or from related address in included (TV uses locn/thoroughfare, schema:streetAddress)
+  let street = s(attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || attr["thoroughfare"] || attr["locn:thoroughfare"] || "");
+  const addrRef = rel.address?.data != null ? (Array.isArray(rel.address.data) ? rel.address.data[0] : rel.address.data) : null;
+  if (!street && addrRef && included.length) {
+    const addr = included.find((i) => i.type === addrRef.type && i.id === addrRef.id);
+    if (addr) {
+      const aa = addr.attributes || {};
+      street = s(aa["street"] || aa["schema:streetAddress"] || aa["thoroughfare"] || aa["locn:thoroughfare"] || "");
+      if (!postalCode) postalCode = s(aa["postalCode"] || aa["postcode"] || aa["postCode"] || aa["locn:postCode"] || "");
+      if (!municipality) municipality = s(aa["addressLocality"] || aa["schema:addressLocality"] || aa["adminUnitL2"] || "");
+    }
+  }
+  if (!postalCode) postalCode = s(attr["postalCode"] || attr["postcode"] || attr["postal-code"] || attr["locn:postCode"] || "");
+
   const contactPoints = rel["contact-points"]?.data || [];
   const phones = [],
     emails = [],
@@ -599,7 +614,7 @@ function parseLodging(raw, included = []) {
     toeristischeRegio: s(toeristischeRegio),
     type: s(type),
     postalCode: s(postalCode),
-    street: s(attr["street"] || attr["schema:address"]?.["schema:streetAddress"] || ""),
+    street: street,
     sleepPlaces: n(
       attr["number-of-sleeping-places"] ||
         attr["number-of-sleep-places"] ||
@@ -665,8 +680,12 @@ app.get("/api/panden", requireAuth, (req, res) => {
     const rows = db.prepare(`SELECT data FROM properties ${where} ${orderBy} LIMIT ? OFFSET ?`).all(...params, size, offset);
 
     const properties = rows.map(r => {
-      try { return JSON.parse(r.data); }
-      catch { return null; }
+      try {
+        const data = JSON.parse(r.data);
+        if (data && data.raw && Array.isArray(data.included)) return parseLodging(data.raw, data.included);
+        if (data && data.name !== undefined && !data.raw) return data;
+        return data;
+      } catch { return null; }
     }).filter(Boolean);
 
     res.json({
