@@ -778,6 +778,15 @@ app.get("/api/sync", (req, res) => {
   syncFromVF().catch(console.error);
 });
 
+app.post("/api/sync/tv", (req, res) => {
+  res.json({ ok: true, message: "TV sync started (Toerisme Vlaanderen). Duurt enkele minuten." });
+  syncPropertiesFromTV().catch(console.error);
+});
+app.get("/api/sync/tv", (req, res) => {
+  res.json({ ok: true, message: "TV sync started (Toerisme Vlaanderen). Duurt enkele minuten." });
+  syncPropertiesFromTV().catch(console.error);
+});
+
 // POST /api/backfill — re-index all stored data into indexed columns
 app.post("/api/backfill", requireAuth, (req, res) => {
   res.json({ ok: true, message: "Backfill started" });
@@ -1050,11 +1059,14 @@ async function startServer() {
       syncFromVF().catch(console.error);
     } else if (vfCount === 0) {
       console.log("[startup] Old UUID data detected — starting fresh VF sync...");
-      // Wipe old data and start fresh
       db.exec("DELETE FROM properties");
       syncFromVF().catch(console.error);
     } else {
       console.log(`[startup] ${count} properties in DB (${vfCount} VF records).`);
+    }
+    if (process.env.AUTO_SYNC_TV_ON_STARTUP === "1") {
+      console.log("[startup] AUTO_SYNC_TV_ON_STARTUP=1 — starting TV sync in background...");
+      syncPropertiesFromTV().catch(console.error);
     }
   });
 }
