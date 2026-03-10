@@ -658,6 +658,28 @@ app.get("/api/health", requireAuth, (req, res) => {
   });
 });
 
+// meta info for filters
+app.get("/api/meta", requireAuth, (req, res) => {
+  const rows = db.prepare("SELECT data FROM properties").all();
+  const provinces = new Set();
+  const types = new Set();
+  const regios = new Set();
+  for (const r of rows) {
+    try {
+      const p = JSON.parse(r.data);
+      const parsed = parseLodging(p.raw || p, p.included || []);
+      if (parsed.province) provinces.add(parsed.province);
+      if (parsed.type) types.add(parsed.type);
+      if (parsed.toeristischeRegio) regios.add(parsed.toeristischeRegio);
+    } catch {}
+  }
+  res.json({
+    provinces: [...provinces].sort(),
+    types: [...types].sort(),
+    regios: [...regios].sort(),
+  });
+});
+
 app.post("/api/login", (req, res) => {
   const { username, password } = req.body;
   if (!username || !password)
