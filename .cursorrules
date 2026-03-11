@@ -1,0 +1,101 @@
+# YourDomi — Cursor AI Rules
+# Based on everything-claude-code best practices, adapted for React/Vite/TypeScript
+
+## Project Context
+This is YourDomi (yourdomi.be), a Belgian short-term rental property management platform.
+Stack: React, Vite, TypeScript, Tailwind CSS, deployed on Vercel.
+The app includes: property analysis tools, deal scoring, owner earnings projections,
+permit/compliance guides (Praktische Gids), and lead capture flows.
+
+---
+
+## Core Principles
+
+### 1. Plan Before You Code
+- For any feature touching more than 2 files, outline the approach before writing code
+- Identify side effects, shared state changes, and component dependencies first
+- Ask clarifying questions before making assumptions on business logic
+
+### 2. Immutability (CRITICAL)
+- Always create new objects/arrays — never mutate existing ones
+- Use spread operators, map, filter, reduce — never push/splice/direct assignment
+- React state must always be set via setState with new references, never mutated in place
+
+### 3. Component Architecture
+- Prefer many small, focused components over large monolithic ones
+- Max ~150 lines per component file; extract sub-components if exceeding this
+- Co-locate related files: Component.tsx, Component.types.ts, Component.test.tsx
+- Keep business logic out of components — extract to custom hooks or utility functions
+
+### 4. TypeScript
+- Always define explicit types for props, API responses, and state shapes
+- Never use `any` — use `unknown` and narrow with type guards if type is uncertain
+- Define shared types in a central `types/` directory
+- Use discriminated unions for complex state (e.g. loading/error/success states)
+
+### 5. Security
+- NEVER hardcode API keys, tokens, or secrets in source code
+- All secrets go in `.env` files — reference via `import.meta.env.VITE_*`
+- Validate and sanitize all user inputs before processing
+- Never expose internal data structures or error details to the UI
+
+### 6. Naming & Style
+- Components: PascalCase (e.g. `PropertyCard`, `DealScoreWidget`)
+- Hooks: camelCase with `use` prefix (e.g. `usePropertyAnalysis`)
+- Utils/helpers: camelCase (e.g. `calculateOwnerEarnings`)
+- Constants: SCREAMING_SNAKE_CASE (e.g. `MAX_DEAL_SCORE`)
+- Files: match the primary export name (e.g. `PropertyCard.tsx` for `PropertyCard`)
+
+### 7. Styling (Tailwind)
+- Use Tailwind utility classes; avoid inline styles except for truly dynamic values
+- Define brand colors and spacing in `tailwind.config.ts` — don't hardcode hex values
+- Use `cn()` utility (clsx/tailwind-merge) for conditional class names
+- Keep responsive variants consistent: mobile-first with `md:` and `lg:` breakpoints
+
+### 8. Data Fetching & State
+- Use React Query (or similar) for server state — don't store API data in useState
+- Separate server state (API data) from UI state (modals, form inputs)
+- Always handle loading, error, and empty states explicitly — never leave them implicit
+- Debounce expensive calculations and API calls triggered by user input
+
+### 9. Performance
+- Memoize expensive computations with `useMemo`
+- Memoize stable callback references with `useCallback` when passing to child components
+- Lazy-load routes and heavy components with `React.lazy` + `Suspense`
+- Avoid unnecessary re-renders: check component dependencies before adding to state
+
+### 10. Git & Commits
+- Commit format: `<type>: <description>`
+  - Types: `feat`, `fix`, `refactor`, `docs`, `style`, `test`, `chore`
+  - Example: `feat: add deal score visualization to property report`
+- Keep commits atomic — one logical change per commit
+- Never commit `.env` files or any file containing secrets
+
+---
+
+## YourDomi-Specific Patterns
+
+### Property Analysis Reports
+- Deal scores are always between 0–100; display with color coding (red/amber/green)
+- Owner earnings projections must show monthly and annual breakdowns
+- Permit/compliance content is city-specific — always check `city` prop before rendering
+
+### Lead Capture
+- Lead modal must always have a visible close mechanism
+- Form validation runs on submit, not on every keystroke
+- On successful submission, show confirmation before redirecting
+
+### Calculations
+- All currency is EUR — format with `Intl.NumberFormat('nl-BE', { style: 'currency', currency: 'EUR' })`
+- Occupancy rates are expressed as decimals (0.72) internally, percentages (72%) in UI
+- Never display raw API numbers directly — always run through formatter functions
+
+---
+
+## What NOT To Do
+- Don't use `console.log` in committed code — use a proper logger or remove before commit
+- Don't add dependencies without checking bundle size impact first
+- Don't create files over 300 lines — split them
+- Don't use `// @ts-ignore` — fix the type issue properly
+- Don't leave TODO comments in committed code without a linked issue
+- Don't fetch data directly in components — use hooks or query functions
