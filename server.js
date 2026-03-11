@@ -710,7 +710,8 @@ function parseLodging(raw, included = []) {
     const reg = regRef ? findIncluded(regRef, included) : null;
     if (reg?.attributes) rawName = one(reg.attributes, nameKeys);
   }
-  const genericPatterns = /^(pand\s*\d*|vakantiewoning|naamloze|no name|—|\s*)$/i;
+  // Treat very generic or useless names as placeholders, including plain "Airbnb"
+  const genericPatterns = /^(pand\s*\d*|vakantiewoning|naamloze|no name|airbnb|air bnb|bnb|—|\s*)$/i;
   const isGeneric = !rawName || genericPatterns.test(rawName.trim());
   const displayName = !isGeneric
     ? rawName.trim()
