@@ -1106,7 +1106,7 @@ Zoek systematisch met deze queries (doe elke zoekactie apart):
 3. web_search: "${(name || "").slice(0, 40)} ${municipality} vakantiewoning" → zoek directe website
 4. Als Airbnb URL gevonden: web_fetch de listing pagina → extraheer foto URLs (a0.muscache.com CDN), prijs, beoordeling, en inhoud van gastreviews (tekst of snippets).
 5. Als Booking URL gevonden: web_fetch de listing pagina → extraheer foto URLs (cf.bstatic.com CDN), prijs, beoordeling, en inhoud van gastreviews.
-${websiteStep ? websiteStep + "\n\n" : ""}REVIEWS VOOR VERKOOPGESPREK: Als je een Airbnb- of Booking-listing hebt opgehaald, analyseer de gastreviews (of review-snippets op de pagina / in zoekresultaten). Zoek terugkerende thema's die we in het verkoopgesprek kunnen gebruiken, bv.: slechte of inconsistente schoonmaak, lawaai/geluid, parkeren, trage of slechte communicatie, ontbrekende voorzieningen, prijs/kwaliteit. Geef 2-5 korte punten in "reviewThemes" (Nederlands). Geen punten = lege array.
+${websiteStep ? websiteStep + "\n\n" : ""}REVIEWS VOOR VERKOOPGESPREK: Als je een Airbnb- of Booking-listing hebt opgehaald, analyseer de gastreviews (of review-snippets op de pagina / in zoekresultaten). Zoek terugkerende thema's die we in het verkoopgesprek kunnen gebruiken, bv.: slechte of inconsistente schoonmaak, lawaai/geluid, parkeren, trage of slechte communicatie, ontbrekende voorzieningen, prijs/kwaliteit. Geef 2-5 korte punten in "reviewThemes" (Nederlands). Geen punten = lege array. Zet "slechteReviews" op true als de gastreviews overwegend negatief zijn of terugkerende klachten noemen die een duidelijke verbeterkans geven.
 
 BELANGRIJK voor websites:
 - Voeg ALLEEN een website toe als je deze effectief hebt kunnen ophalen via web_fetch en hij HTTP 200 teruggeeft met echte vakantieverhuur content
@@ -1141,6 +1141,7 @@ Geef ALLEEN deze JSON (geen markdown):
   "pitchhoek": "Na de vragen: wat biedt yourdomi specifiek voor DEZE eigenaar. 2 zinnen.",
   "zwaktes": ["verbeterpunt 1", "verbeterpunt 2", "..."],
   "reviewThemes": ["terugkerend punt uit reviews", "..."],
+  "slechteReviews": true|false,
   "airbnb": { "gevonden": true|false, "url": "...", "beoordeling": "...", "aantalReviews": "...", "prijsPerNacht": "...", "bezettingsgraad": "...", "fotoUrls": [] },
   "booking": { "gevonden": true|false, "url": "...", "beoordeling": "...", "aantalReviews": "...", "prijsPerNacht": "...", "fotoUrls": [] },
   "directWebsite": { "gevonden": true|false, "werkt": true|false, "poorlyBuilt": true|false, "url": "...", "fotoUrls": [] },
@@ -1194,6 +1195,7 @@ async function runOneFullEnrichment(property, portfolioInfo) {
       pitchhoek: "yourdomi.be kan uw kortetermijnverhuur volledig beheren.",
       zwaktes: [],
       reviewThemes: [],
+      slechteReviews: false,
       airbnb: { gevonden: false },
       booking: { gevonden: false },
       directWebsite: { gevonden: false },
