@@ -28,7 +28,7 @@ let backgroundAgentsLast = {
   startedAt: null,
   finishedAt: null,
   error: null,
-  counts: { airbnb: 0, booking: 0, website: 0, images: 0 },
+  counts: { airbnb: 0, booking: 0, website: 0, images: 0, full: 0 },
 };
 async function runAllBackgroundAgentsOnce() {
   if (process.env.PLATFORM_SCAN_ENABLED !== "1") {
@@ -49,22 +49,29 @@ async function runAllBackgroundAgentsOnce() {
     startedAt: Date.now(),
     finishedAt: null,
     error: null,
-    counts: { airbnb: 0, booking: 0, website: 0, images: 0 },
+    counts: { airbnb: 0, booking: 0, website: 0, images: 0, full: 0 },
   };
   try {
-    const [a, b, w, i] = await Promise.all([
+    const [a, b, w, i, f] = await Promise.all([
       runAirbnbAgentBatch(),
       runBookingAgentBatch(),
       runWebsiteAgentBatch(),
       runImageScrapeBatch(),
+      runFullAiAgentBatch(),
     ]);
     backgroundAgentsLast.counts = {
       airbnb: Number(a) || 0,
       booking: Number(b) || 0,
       website: Number(w) || 0,
       images: Number(i) || 0,
+      full: Number(f) || 0,
     };
-    const total = backgroundAgentsLast.counts.airbnb + backgroundAgentsLast.counts.booking + backgroundAgentsLast.counts.website + backgroundAgentsLast.counts.images;
+    const total =
+      backgroundAgentsLast.counts.airbnb +
+      backgroundAgentsLast.counts.booking +
+      backgroundAgentsLast.counts.website +
+      backgroundAgentsLast.counts.images +
+      backgroundAgentsLast.counts.full;
     if (total === 0) {
       console.log("[agents] No work (all up to date).");
     } else {
@@ -795,7 +802,7 @@ app.get("/api/panden", requireAuth, (req, res) => {
   try {
     const page = parseInt(req.query.page || "1");
     const size = Math.min(parseInt(req.query.size || "50"), 200);
-    const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite } = req.query;
+    const { zoek, gemeente, provincie, status, minSlaap, maxSlaap, heeftTelefoon, heeftEmail, heeftWebsite, belstatus } = req.query;
 
     const totalRow = db.prepare(
       `SELECT COUNT(*) as c FROM properties WHERE ${BASE_WHERE}`
@@ -821,6 +828,13 @@ app.get("/api/panden", requireAuth, (req, res) => {
     if (heeftTelefoon === "1") conditions.push("phone IS NOT NULL AND phone != ''");
     if (heeftEmail    === "1") conditions.push("email IS NOT NULL AND email != ''");
     if (heeftWebsite  === "1") conditions.push("website IS NOT NULL AND website != ''");
+    if (belstatus === "terugbellen") {
+      conditions.push("id IN (SELECT id FROM outcomes WHERE outcome IN ('callback','terugbellen'))");
+    } else if (belstatus === "interesse") {
+      conditions.push("id IN (SELECT id FROM outcomes WHERE outcome IN ('gebeld_interesse','interesse'))");
+    } else if (belstatus === "afgewezen") {
+      conditions.push("id IN (SELECT id FROM outcomes WHERE outcome = 'afgewezen')");
+    }
 
     const where   = "WHERE " + conditions.join(" AND ");
     const sortMap = {
@@ -1953,6 +1967,111 @@ async function runImageScrapeBatch() {
   return batch.length;
 }
 
+// Agent 5: Full AI enrichment — runs in background for all listings, prioritising ones with Airbnb/Booking/website
+async function runFullAiAgentBatch() {
+  if (!ANTHROPIC_KEY || !db) return 0;
+  const staleDays = Math.max(parseInt(process.env.AI_STALE_DAYS || "100", 10), 1);
+  const staleBefore = Date.now() - staleDays * 86400000;
+
+  const rows = db
+    .prepare(
+      `SELECT p.id, p.data, p.name, p.municipality, p.province, p.status, p.slaapplaatsen, p.phone, p.phone2, p.email, p.website, p.type, p.regio, p.date_online, p.postal_code, p.street,
+              e.enriched_at AS enriched_at,
+              s.data AS scan_data
+       FROM properties p
+       LEFT JOIN enrichment e ON e.id = p.id
+       LEFT JOIN platform_scan s ON s.id = p.id
+       WHERE (e.enriched_at IS NULL OR e.enriched_at < ?)
+       LIMIT 80`
+    )
+    .all(staleBefore);
+
+  if (!rows.length) return 0;
+
+  const enrichedInsert = db.prepare("INSERT OR REPLACE INTO enrichment (id, data, enriched_at) VALUES (?,?,?)");
+
+  const priorityScore = (row) => {
+    let scan = null;
+    if (row.scan_data) {
+      try { scan = JSON.parse(row.scan_data); } catch (_) { scan = null; }
+    }
+    const hasAirbnb = !!(scan?.airbnb?.url || (row.website || "").toLowerCase().includes("airbnb.com"));
+    const hasBooking = !!(scan?.booking?.url || (row.website || "").toLowerCase().includes("booking.com"));
+    const hasWebsite = !!(scan?.website?.url || row.website);
+    let score = 0;
+    if (hasAirbnb) score += 3;
+    if (hasBooking) score += 2;
+    if (hasWebsite) score += 1;
+    return -score; // lower first in sort()
+  };
+
+  rows.sort((a, b) => priorityScore(a) - priorityScore(b));
+  const FULL_AI_PARALLEL = Math.min(parseInt(process.env.FULL_AI_PARALLEL || "2", 10), 4);
+  const FULL_AI_DELAY_MS = parseInt(process.env.FULL_AI_DELAY_MS || "3000", 10);
+  const batch = rows.slice(0, FULL_AI_PARALLEL * 2);
+  if (!batch.length) return 0;
+
+  let processed = 0;
+  for (let i = 0; i < batch.length; i += FULL_AI_PARALLEL) {
+    const chunk = batch.slice(i, i + FULL_AI_PARALLEL);
+    const phoneGroups = new Map();
+    for (const r of chunk) {
+      const key = normalizePhoneForGroup(r.phone || r.phone2);
+      if (!key) continue;
+      if (!phoneGroups.has(key)) phoneGroups.set(key, []);
+      phoneGroups.get(key).push(r.id);
+    }
+    const portfolioByKey = new Map();
+    for (const [key, ids] of phoneGroups) {
+      if (ids.length > 1) {
+        portfolioByKey.set(key, {
+          count: ids.length,
+          names: ids.map((id) => chunk.find((p) => p.id === id)?.name || id),
+        });
+      }
+    }
+    const results = await Promise.all(
+      chunk.map((r) => {
+        const key = normalizePhoneForGroup(r.phone || r.phone2);
+        const portfolioInfo = portfolioByKey.get(key) || null;
+        const property = {
+          id: r.id,
+          name: r.name,
+          street: r.street,
+          postalCode: r.postal_code,
+          municipality: r.municipality,
+          province: r.province,
+          status: r.status,
+          starRating: null,
+          sleepPlaces: r.slaapplaatsen,
+          slaapplaatsen: r.slaapplaatsen,
+          units: 1,
+          phone: r.phone,
+          phone2: r.phone2,
+          email: r.email,
+          website: r.website,
+          type: r.type,
+          toeristischeRegio: r.regio,
+          dateOnline: r.date_online,
+        };
+        return runOneFullEnrichment(property, portfolioInfo).then((data) => ({ id: r.id, data }));
+      })
+    );
+    const now = Date.now();
+    for (const { id, data } of results) {
+      enrichedInsert.run(id, JSON.stringify(data), now);
+      processed += 1;
+    }
+    if (i + FULL_AI_PARALLEL < batch.length) {
+      await new Promise((r) => setTimeout(r, FULL_AI_DELAY_MS));
+    }
+  }
+  if (processed > 0) {
+    console.log("[agent-full-ai] Enriched", processed, "properties in background.");
+  }
+  return processed;
+}
+
 app.post("/api/monday", requireAuth, async (req, res) => {
   const apiKey = req.body.apiKey || process.env.MONDAY_API_KEY;
   const { query, variables } = req.body;
@@ -2052,7 +2171,7 @@ async function startServer() {
         runBackgroundBurst().catch(console.error);
         const interval = setInterval(runAllAgents, 2 * 60 * 1000);
         interval.unref?.();
-        console.log("[startup] Four background agents enabled (Airbnb, Booking, website, pictures) — running in parallel every 2 min.");
+        console.log("[startup] Five background agents enabled (full AI, Airbnb, Booking, website, pictures) — running in parallel every 2 min.");
       }, 15000);
     }
   });
