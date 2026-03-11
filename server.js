@@ -1253,96 +1253,155 @@ Regels:
   }
 });
 
-// Background: light platform scan (website + Airbnb + Booking only) — runs across list, no button
-// Batched + parallel for speed: PLATFORM_SCAN_BATCH per run, PLATFORM_SCAN_PARALLEL concurrent calls
+// Background: four separate agents (Airbnb, Booking, website, pictures), each batched, running in parallel for quicker results.
 const PLATFORM_SCAN_DAYS = parseInt(process.env.PLATFORM_SCAN_DAYS || "7");
 const PLATFORM_SCAN_BATCH = parseInt(process.env.PLATFORM_SCAN_BATCH || "12");
 const PLATFORM_SCAN_PARALLEL = Math.min(parseInt(process.env.PLATFORM_SCAN_PARALLEL || "4"), 8);
 
-async function runOneLightScan(id, name, municipality, website) {
-  const prompt = `Voor deze vakantieverhuur in België:
-Naam: ${name || "onbekend"}
-Gemeente: ${municipality || "onbekend"}
-Website uit register: ${website || "geen"}
+function getPlatformScanRow(db, id) {
+  const row = db.prepare("SELECT data, scanned_at FROM platform_scan WHERE id = ?").get(id);
+  let data = {};
+  if (row && row.data) try { data = JSON.parse(row.data); } catch (_) {}
+  return data;
+}
+function mergePlatformScan(db, id, partial) {
+  const data = getPlatformScanRow(db, id);
+  const merged = { ...data, ...partial };
+  const now = Date.now();
+  db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)").run(id, JSON.stringify(merged), now);
+}
 
-Voer uit (gebruik web_search):
-1. Zoek: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Airbnb" → vind airbnb.com/rooms/... URL indien aanwezig.
-2. Zoek: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Booking.com" → vind booking.com/hotel/... URL indien aanwezig.
-
-Geef ALLEEN een JSON-object (geen markdown):
-{
-  "website": { "gevonden": true|false, "url": "https://..." of null },
-  "airbnb": { "gevonden": true|false, "url": "https://www.airbnb.com/rooms/..." of null },
-  "booking": { "gevonden": true|false, "url": "https://www.booking.com/hotel/..." of null }
-}`;
+async function runOneAirbnbScan(id, name, municipality) {
+  const prompt = `Vakantieverhuur België: Naam: ${name || "onbekend"}, Gemeente: ${municipality || "onbekend"}. Zoek met web_search: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Airbnb". Geef ALLEEN JSON: { "airbnb": { "gevonden": true|false, "url": "https://www.airbnb.com/rooms/..." of null } }`;
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 512,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        messages: [{ role: "user", content: prompt }],
-      }),
-      signal: AbortSignal.timeout(45000),
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 256, tools: [{ type: "web_search_20250305", name: "web_search" }], messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(40000),
     });
     const data = await r.json();
     const text = (data.content || []).find(c => c.type === "text")?.text || "{}";
     const clean = text.replace(/```json|```/g, "").trim();
     const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
     const parsed = JSON.parse(clean.slice(s, e + 1));
-    return {
-      website: parsed.website && typeof parsed.website === "object" ? { gevonden: !!parsed.website.gevonden, url: parsed.website.url || null } : { gevonden: false, url: null },
-      airbnb: parsed.airbnb && typeof parsed.airbnb === "object" ? { gevonden: !!parsed.airbnb.gevonden, url: parsed.airbnb.url || null } : { gevonden: false, url: null },
-      booking: parsed.booking && typeof parsed.booking === "object" ? { gevonden: !!parsed.booking.gevonden, url: parsed.booking.url || null } : { gevonden: false, url: null },
-    };
+    const airbnb = parsed.airbnb && typeof parsed.airbnb === "object" ? { gevonden: !!parsed.airbnb.gevonden, url: parsed.airbnb.url || null } : { gevonden: false, url: null };
+    return { airbnb };
   } catch (e) {
-    console.warn("[platform-scan] Error for", id, e.message);
-    return { website: { gevonden: false, url: null }, airbnb: { gevonden: false, url: null }, booking: { gevonden: false, url: null } };
+    console.warn("[agent-airbnb] Error", id, e.message);
+    return { airbnb: { gevonden: false, url: null } };
   }
 }
 
-async function runLightScanBatch() {
+async function runOneBookingScan(id, name, municipality) {
+  const prompt = `Vakantieverhuur België: Naam: ${name || "onbekend"}, Gemeente: ${municipality || "onbekend"}. Zoek met web_search: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Booking.com". Geef ALLEEN JSON: { "booking": { "gevonden": true|false, "url": "https://www.booking.com/hotel/..." of null } }`;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 256, tools: [{ type: "web_search_20250305", name: "web_search" }], messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(40000),
+    });
+    const data = await r.json();
+    const text = (data.content || []).find(c => c.type === "text")?.text || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
+    const parsed = JSON.parse(clean.slice(s, e + 1));
+    const booking = parsed.booking && typeof parsed.booking === "object" ? { gevonden: !!parsed.booking.gevonden, url: parsed.booking.url || null } : { gevonden: false, url: null };
+    return { booking };
+  } catch (e) {
+    console.warn("[agent-booking] Error", id, e.message);
+    return { booking: { gevonden: false, url: null } };
+  }
+}
+
+async function runOneWebsiteScan(id, name, municipality, website) {
+  const prompt = `Vakantieverhuur België: Naam: ${name || "onbekend"}, Gemeente: ${municipality || "onbekend"}, Website: ${website || "geen"}. Zoek eventueel met web_search: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} vakantiewoning". Als er een directe website is (geen Airbnb/Booking), geef die. Geef ALLEEN JSON: { "website": { "gevonden": true|false, "url": "https://..." of null } }`;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 256, tools: [{ type: "web_search_20250305", name: "web_search" }], messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(40000),
+    });
+    const data = await r.json();
+    const text = (data.content || []).find(c => c.type === "text")?.text || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
+    const parsed = JSON.parse(clean.slice(s, e + 1));
+    const websiteOut = parsed.website && typeof parsed.website === "object" ? { gevonden: !!parsed.website.gevonden, url: parsed.website.url || null } : { gevonden: false, url: null };
+    return { website: websiteOut };
+  } catch (e) {
+    console.warn("[agent-website] Error", id, e.message);
+    return { website: { gevonden: false, url: null } };
+  }
+}
+
+function agentTier(row, kind) {
+  const w = (s) => (s || "").toLowerCase();
+  const web = w(row.website || "");
+  const name = w(row.name || "");
+  if (kind === "airbnb") return web.includes("airbnb.com") || name.includes("airbnb");
+  if (kind === "booking") return web.includes("booking.com") || name.includes("booking");
+  if (kind === "website") return true; // all rest for website agent
+  return false;
+}
+
+async function runAirbnbAgentBatch() {
   if (!ANTHROPIC_KEY || !db) return;
   const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
   const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
   const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
-  const allIds = db.prepare("SELECT id, name, municipality, website FROM properties").all();
-  let toScan = allIds.filter(r => !scanned.has(r.id) || stale.includes(r.id));
-  const w = (s) => (s || "").toLowerCase();
-  toScan.sort((a, b) => {
-    const aHas = w(a.website).includes("airbnb.com") || w(a.website).includes("booking.com");
-    const bHas = w(b.website).includes("airbnb.com") || w(b.website).includes("booking.com");
-    if (aHas && !bHas) return -1;
-    if (!aHas && bHas) return 1;
-    return 0;
-  });
+  const all = db.prepare("SELECT id, name, municipality, website FROM properties").all();
+  let toScan = all.filter(r => (agentTier(r, "airbnb")) && (!scanned.has(r.id) || stale.includes(r.id)));
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
   if (toScan.length === 0) return;
-  const insert = db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)");
-  const now = Date.now();
-  // Run in parallel chunks of PLATFORM_SCAN_PARALLEL for speed
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
-    const results = await Promise.all(chunk.map(row =>
-      runOneLightScan(row.id, row.name, row.municipality, row.website).then(data => ({ id: row.id, data }))
-    ));
-    for (const { id, data } of results) {
-      insert.run(id, JSON.stringify(data), now);
-    }
-    if (i + PLATFORM_SCAN_PARALLEL < toScan.length) {
-      await new Promise(r => setTimeout(r, 800));
-    }
+    const results = await Promise.all(chunk.map(row => runOneAirbnbScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
+    for (const { id, data } of results) mergePlatformScan(db, id, data);
+    if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
-  console.log("[platform-scan] Scanned", toScan.length, "properties in parallel (website/Airbnb/Booking).");
+  console.log("[agent-airbnb] Scanned", toScan.length, "listings.");
 }
 
-// Image scrape: fetch listing pages (Airbnb/Booking/website) and extract photo URLs; store in platform_scan
+async function runBookingAgentBatch() {
+  if (!ANTHROPIC_KEY || !db) return;
+  const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
+  const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
+  const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
+  const all = db.prepare("SELECT id, name, municipality, website FROM properties").all();
+  let toScan = all.filter(r => agentTier(r, "booking") && (!scanned.has(r.id) || stale.includes(r.id)));
+  toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
+  if (toScan.length === 0) return;
+  for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
+    const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
+    const results = await Promise.all(chunk.map(row => runOneBookingScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
+    for (const { id, data } of results) mergePlatformScan(db, id, data);
+    if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
+  }
+  console.log("[agent-booking] Scanned", toScan.length, "listings.");
+}
+
+async function runWebsiteAgentBatch() {
+  if (!ANTHROPIC_KEY || !db) return;
+  const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
+  const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
+  const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
+  const all = db.prepare("SELECT id, name, municipality, website FROM properties").all();
+  let toScan = all.filter(r => !agentTier(r, "airbnb") && !agentTier(r, "booking") && (!scanned.has(r.id) || stale.includes(r.id)));
+  toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
+  if (toScan.length === 0) return;
+  for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
+    const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
+    const results = await Promise.all(chunk.map(row => runOneWebsiteScan(row.id, row.name, row.municipality, row.website).then(data => ({ id: row.id, data }))));
+    for (const { id, data } of results) mergePlatformScan(db, id, data);
+    if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
+  }
+  console.log("[agent-website] Scanned", toScan.length, "listings.");
+}
+
+// Agent 4: Pictures — fetch listing pages, extract photo URLs, store in platform_scan for cards and dossier
 const IMAGE_SCRAPE_BATCH = Math.min(parseInt(process.env.IMAGE_SCRAPE_BATCH || "6"), 12);
 const IMAGE_SCRAPE_PARALLEL = Math.min(parseInt(process.env.IMAGE_SCRAPE_PARALLEL || "3"), 6);
 const PHOTO_DOMAINS = ["a0.muscache.com", "muscache.com", "cf.bstatic.com", "bstatic.com", "dynamicmedia", "images.unsplash.com", "imgur.com", "cloudinary.com"];
@@ -1380,6 +1439,14 @@ async function fetchImagesForUrls(urls) {
   return all.filter(u => { if (seen.has(u)) return false; seen.add(u); return true; }).slice(0, 24);
 }
 
+function imageScrapeTier(entry) {
+  const d = entry.data || {};
+  if (d.airbnb?.url) return 0;
+  if (d.booking?.url) return 1;
+  if (d.website?.url) return 2;
+  return 3;
+}
+
 async function runImageScrapeBatch() {
   if (!db) return;
   const rows = db.prepare("SELECT id, data FROM platform_scan").all();
@@ -1399,9 +1466,10 @@ async function runImageScrapeBatch() {
       else if (!data.website?.url) urls.push(pw);
     }
     if (urls.length === 0) continue;
-    toScrape.push({ id: row.id, urls });
+    toScrape.push({ id: row.id, urls, data: { airbnb: data.airbnb, booking: data.booking, website: data.website } });
   }
   if (toScrape.length === 0) return;
+  toScrape.sort((a, b) => imageScrapeTier(a) - imageScrapeTier(b));
   const batch = toScrape.slice(0, IMAGE_SCRAPE_BATCH);
   const update = db.prepare("UPDATE platform_scan SET data = ?, scanned_at = ? WHERE id = ?");
   for (let i = 0; i < batch.length; i += IMAGE_SCRAPE_PARALLEL) {
@@ -1516,15 +1584,18 @@ async function startServer() {
     }
     if (process.env.PLATFORM_SCAN_ENABLED === "1" && ANTHROPIC_KEY) {
       setTimeout(() => {
-        const runBoth = () => {
-          runLightScanBatch()
-            .then(() => runImageScrapeBatch())
-            .catch(console.error);
+        const runAllAgents = () => {
+          Promise.all([
+            runAirbnbAgentBatch(),
+            runBookingAgentBatch(),
+            runWebsiteAgentBatch(),
+            runImageScrapeBatch(),
+          ]).catch(console.error);
         };
-        runBoth();
-        const interval = setInterval(runBoth, 2 * 60 * 1000);
+        runAllAgents();
+        const interval = setInterval(runAllAgents, 2 * 60 * 1000);
         interval.unref?.();
-        console.log("[startup] Platform scan + image scrape enabled — running in background.");
+        console.log("[startup] Four background agents enabled (Airbnb, Booking, website, pictures) — running in parallel every 2 min.");
       }, 15000);
     }
   });
