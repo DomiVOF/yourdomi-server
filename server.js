@@ -24,20 +24,55 @@ let db;
 // If Railway scales to zero / sleeps on no traffic, nothing runs until it wakes up.
 // =============================================================================
 let backgroundAgentsRunning = false;
+let backgroundAgentsLast = {
+  startedAt: null,
+  finishedAt: null,
+  error: null,
+  counts: { airbnb: 0, booking: 0, website: 0, images: 0 },
+};
 async function runAllBackgroundAgentsOnce() {
-  if (process.env.PLATFORM_SCAN_ENABLED !== "1") return;
-  if (!ANTHROPIC_KEY || !db) return;
+  if (process.env.PLATFORM_SCAN_ENABLED !== "1") {
+    backgroundAgentsLast = { ...backgroundAgentsLast, error: "PLATFORM_SCAN_ENABLED!=1" };
+    return;
+  }
+  if (!ANTHROPIC_KEY) {
+    backgroundAgentsLast = { ...backgroundAgentsLast, error: "ANTHROPIC_KEY missing" };
+    return;
+  }
+  if (!db) {
+    backgroundAgentsLast = { ...backgroundAgentsLast, error: "db not ready" };
+    return;
+  }
   if (backgroundAgentsRunning) return;
   backgroundAgentsRunning = true;
+  backgroundAgentsLast = {
+    startedAt: Date.now(),
+    finishedAt: null,
+    error: null,
+    counts: { airbnb: 0, booking: 0, website: 0, images: 0 },
+  };
   try {
-    await Promise.all([
+    const [a, b, w, i] = await Promise.all([
       runAirbnbAgentBatch(),
       runBookingAgentBatch(),
       runWebsiteAgentBatch(),
       runImageScrapeBatch(),
     ]);
+    backgroundAgentsLast.counts = {
+      airbnb: Number(a) || 0,
+      booking: Number(b) || 0,
+      website: Number(w) || 0,
+      images: Number(i) || 0,
+    };
+    const total = backgroundAgentsLast.counts.airbnb + backgroundAgentsLast.counts.booking + backgroundAgentsLast.counts.website + backgroundAgentsLast.counts.images;
+    if (total === 0) {
+      console.log("[agents] No work (all up to date).");
+    } else {
+      console.log("[agents] Cycle done:", backgroundAgentsLast.counts);
+    }
   } finally {
     backgroundAgentsRunning = false;
+    backgroundAgentsLast.finishedAt = Date.now();
   }
 }
 
@@ -1113,6 +1148,19 @@ app.post("/api/admin/run-background-agents", (req, res) => {
     .catch((e) => res.status(500).json({ error: e.message }));
 });
 
+// GET /api/admin/agents-status — quick visibility into background agents
+app.get("/api/admin/agents-status", (req, res) => {
+  const adminPw = process.env.ADMIN_PASSWORD;
+  if (!adminPw) return res.status(403).json({ error: "ADMIN_PASSWORD not set" });
+  const provided = req.headers["x-admin-password"] || req.query.adminPassword || req.query.password;
+  if (String(provided || "") !== String(adminPw)) return res.status(403).json({ error: "Wrong admin password" });
+  res.json({
+    ok: true,
+    running: backgroundAgentsRunning,
+    last: backgroundAgentsLast,
+  });
+});
+
 // =============================================================================
 // ONE-TIME: Full AI enrichment for all type=vakantiewoning
 // =============================================================================
@@ -1720,7 +1768,7 @@ async function runAirbnbAgentBatch() {
     return !hasUrl && needsRescan(meta.airbnbCheckedAt, AGENT_STALE_DAYS_AIRBNB, meta.airbnbFailCount);
   });
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
-  if (toScan.length === 0) return;
+  if (toScan.length === 0) return 0;
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneAirbnbScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
@@ -1731,6 +1779,7 @@ async function runAirbnbAgentBatch() {
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[agent-airbnb] Scanned", toScan.length, "listings.");
+  return toScan.length;
 }
 
 async function runBookingAgentBatch() {
@@ -1745,7 +1794,7 @@ async function runBookingAgentBatch() {
     return !hasUrl && needsRescan(meta.bookingCheckedAt, AGENT_STALE_DAYS_BOOKING, meta.bookingFailCount);
   });
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
-  if (toScan.length === 0) return;
+  if (toScan.length === 0) return 0;
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneBookingScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
@@ -1756,6 +1805,7 @@ async function runBookingAgentBatch() {
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[agent-booking] Scanned", toScan.length, "listings.");
+  return toScan.length;
 }
 
 async function runWebsiteAgentBatch() {
@@ -1770,7 +1820,7 @@ async function runWebsiteAgentBatch() {
     return !hasUrl && needsRescan(meta.websiteCheckedAt, AGENT_STALE_DAYS_WEBSITE, meta.websiteFailCount);
   });
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
-  if (toScan.length === 0) return;
+  if (toScan.length === 0) return 0;
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneWebsiteScan(row.id, row.name, row.municipality, row.website).then(data => ({ id: row.id, data }))));
@@ -1781,6 +1831,7 @@ async function runWebsiteAgentBatch() {
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[agent-website] Scanned", toScan.length, "listings.");
+  return toScan.length;
 }
 
 // Agent 4: Pictures — fetch listing pages, extract photo URLs, store in platform_scan for cards and dossier
@@ -1855,7 +1906,7 @@ async function runImageScrapeBatch() {
     if (urls.length === 0) continue;
     toScrape.push({ id: row.id, urls, data: { airbnb: data.airbnb, booking: data.booking, website: data.website } });
   }
-  if (toScrape.length === 0) return;
+  if (toScrape.length === 0) return 0;
   toScrape.sort((a, b) => imageScrapeTier(a) - imageScrapeTier(b));
   const batch = toScrape.slice(0, IMAGE_SCRAPE_BATCH);
   const update = db.prepare("UPDATE platform_scan SET data = ?, scanned_at = ? WHERE id = ?");
@@ -1877,6 +1928,7 @@ async function runImageScrapeBatch() {
     if (i + IMAGE_SCRAPE_PARALLEL < batch.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[image-scrape] Fetched images for", batch.length, "properties.");
+  return batch.length;
 }
 
 app.post("/api/monday", requireAuth, async (req, res) => {
