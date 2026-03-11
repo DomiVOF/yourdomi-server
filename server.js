@@ -1207,7 +1207,7 @@ function normalizePhoneForGroup(s) {
 
 function buildFullEnrichmentPrompt(property, portfolioInfo) {
   const portfolioContext = portfolioInfo
-    ? `\nBELANGRIJK - PORTFOLIO EIGENAAR: Deze eigenaar heeft ${portfolioInfo.count} panden: ${portfolioInfo.names.join(", ")}\nDit is een HOGE PRIORITEIT portfolio lead. Verwerk dit expliciet in de openingszin.`
+    ? `\nBELANGRIJK - PORTFOLIO EIGENAAR: Deze eigenaar heeft ${portfolioInfo.count} panden: ${portfolioInfo.names.join(", ")}.`
     : "";
   const name = property.name || "onbekend";
   const street = property.street || "";
@@ -1220,47 +1220,27 @@ function buildFullEnrichmentPrompt(property, portfolioInfo) {
   const units = property.units ?? 1;
   const phone = property.phone || "niet beschikbaar";
   const email = property.email || "niet beschikbaar";
-  const website = property.website || "niet gevonden";
-  const websiteStep = website ? `6. web_fetch "${website}" → controleer HTTP status. Als 200 met echte verhuurcontent: werkt=true en zoek foto URLs. Bij fout/parkeerdomein: werkt=false, gevonden=false.` : "";
+  const website = property.website || "";
 
-  return `Je bent een verkoopintelligentie-assistent voor yourdomi.be, een Belgisch beheerbedrijf voor kortetermijnverhuur (Airbnb, Booking.com, VRBO).
-VERKOOPSFILOSOFIE: Wij stellen vragen ipv uitleggen wie we zijn. We laten eigenaars zichzelf "verkopen" door te vragen naar hun situatie, pijnpunten en wensen. Goede verkopers luisteren 70%, spreken 30%.${portfolioContext}
+  return `Je bent een AI-assistent voor yourdomi.be, een Belgisch beheerbedrijf voor kortetermijnverhuur (Airbnb, Booking.com, VRBO). Je focust op één ding: kort en concreet beschrijven in welke situatie de eigenaar nu zit en waar yourdomi kan helpen.${portfolioContext}
 
-Pandgegevens uit Toerisme Vlaanderen register:
+Pandgegevens:
 - Naam: ${name}
 - Adres: ${street}, ${postalCode} ${municipality}, ${province}
 - Status: ${status} | Sterren: ${starRating} | Slaapplaatsen: ${sleepPlaces} | Units: ${units}
-- Tel: ${phone} | Email: ${email} | Website: ${website}
+- Tel: ${phone} | Email: ${email} | Website: ${website || "niet gevonden"}
 
-STAP 1 - Online aanwezigheid zoeken (VERPLICHT - gebruik web_search + web_fetch):
-Zoek systematisch met deze queries (doe elke zoekactie apart):
-1. web_search: "${(name || "").slice(0, 40)} ${municipality} Airbnb" → zoek exacte Airbnb listing URL (airbnb.com/rooms/...)
-2. web_search: "${(name || "").slice(0, 40)} ${municipality} Booking.com" → zoek exacte Booking URL (booking.com/hotel/...)
-3. web_search: "${(name || "").slice(0, 40)} ${municipality} vakantiewoning" → zoek directe website
-4. Als Airbnb URL gevonden: web_fetch de listing pagina → extraheer foto URLs (a0.muscache.com CDN), prijs, beoordeling, en inhoud van gastreviews (tekst of snippets).
-5. Als Booking URL gevonden: web_fetch de listing pagina → extraheer foto URLs (cf.bstatic.com CDN), prijs, beoordeling, en inhoud van gastreviews.
-${websiteStep ? websiteStep + "\n\n" : ""}REVIEWS VOOR VERKOOPGESPREK: Als je een Airbnb- of Booking-listing hebt opgehaald, analyseer de gastreviews (of review-snippets op de pagina / in zoekresultaten). Zoek terugkerende thema's die we in het verkoopgesprek kunnen gebruiken, bv.: slechte of inconsistente schoonmaak, lawaai/geluid, parkeren, trage of slechte communicatie, ontbrekende voorzieningen, prijs/kwaliteit. Geef 2-5 korte punten in "reviewThemes" (Nederlands). Geen punten = lege array. Zet "slechteReviews" op true als de gastreviews overwegend negatief zijn of terugkerende klachten noemen die een duidelijke verbeterkans geven.
+Gebruik eventueel een paar web_search / web_fetch calls om Airbnb, Booking of een eigen website te vinden, maar houd het beknopt (niet te veel tokens).
 
-BELANGRIJK voor websites:
-- Voeg ALLEEN een website toe als je deze effectief hebt kunnen ophalen via web_fetch en hij HTTP 200 teruggeeft met echte vakantieverhuur content
-- Als de fetch faalt (timeout, 404, 403, redirect naar parkeerdomein), zet directWebsite.werkt = false en directWebsite.gevonden = false
-- Parkeer/placeholder sites (bv. "This domain is for sale", Sedo, GoDaddy) tellen NIET als werkende website
-- Zet directWebsite.poorlyBuilt = true als de site WEL werkt maar slecht is: verouderd design, kapotte layout, geen boekingsmogelijkheid, amateuraanpak. Dat is een HEET-signaal (eigenaar kan baat hebben bij yourdomi).
-- Geef ECHTE foto URLs terug die je hebt gevonden via web_fetch op de listing pagina (airbnb CDN: a0.muscache.com, booking CDN: cf.bstatic.com) - geen placeholders
-- Als je geen foto URLs kan extraheren uit de pagina inhoud, geef een lege array terug
+Schrijf vooral een eenvoudige, verkoopklare samenvatting in het Nederlands:
+- Beschrijf in 2–3 zinnen hoe de verhuur NU waarschijnlijk geregeld is (zelfbeheer vs. agentuur, online aanwezigheid, kwaliteit/reviews).
+- Beschrijf in 1–2 zinnen HOE yourdomi concreet kan helpen (beheer, optimalisatie, ontzorging, betere bezetting/prijzen).
+- Bepaal of dit waarschijnlijk een agentuur/beheerskantoor is of de eigenaar zelf (op basis van email/telefoon/website/naam).
 
-STAP 2 - Agentuur detectie:
-Analyseer of het telefoonnummer/email waarschijnlijk een beheerskantoor/agentuur is ipv de eigenaar zelf. Signalen: generiek emaildomein, bekende vastgoedkantoren, meerdere panden op hetzelfde nr, "info@" adressen van vakantieverhuurders.
-
-STAP 3 - Consultieve gespreksstructuur:
-Maak 5-7 open vragen die de eigenaar aan het woord laten. Begin met de situatie peilen, dan pijnpunten, dan wensen. NIET pitchen, NIET uitleggen - VRAGEN. Structuur: situatievragen -> implicatievragen -> wensvragen.
-
-SCORE CRITERIA (volg dit strikt):
-🔥 HEET = Eigenaar beheert ZELF (geen agentuur), heeft directe contactgegevens, pand is NIET of slecht online (kans om waarde te tonen), OF staat al online maar heeft lage reviews/slechte prijszetting (duidelijke pijnpunten). Een SLECHT GEBOUWDE WEBSITE (verouderd, kapotte layout, geen boekingsmogelijkheid) telt als extra HEET-signaal.
-W WARM = Eigenaar beheert zelf maar is al redelijk goed online. Of: contactgegevens beschikbaar maar onduidelijk of zelf beheert. Bellen loont maar minder urgent.
-K KOUD = Duidelijk al professioneel beheerd (agentuur gedetecteerd), geen contactgegevens, of pand is al perfect geoptimaliseerd zonder ruimte voor yourdomi.
-
-PRIORITEIT: Geef 1-10. Als er een Airbnb- of Booking.com-listing is gevonden, tel +2 bij de prioriteit (max 10) zodat onze bellers deze eigenaars sneller kunnen contacteren.
+Scorelogica:
+- HEET = eigenaar (of vermoed eigenaar) beheert zelf en er is duidelijk ruimte voor verbetering (online zichtbaarheid, reviews, pricing, tijdsdruk).
+- WARM = al redelijk goed geregeld, maar nog enkele duidelijke verbeterpunten.
+- KOUD = duidelijk professioneel beheerd of weinig ruimte voor extra meerwaarde.
 
 Geef ALLEEN deze JSON (geen markdown):
 {
