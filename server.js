@@ -974,6 +974,17 @@ app.get("/health", (req, res) => {
   }
 });
 
+// Same, but under /api for easier integration with existing tooling
+app.get("/api/health-public", (req, res) => {
+  try {
+    const props = db ? (db.prepare(`SELECT COUNT(*) as c FROM properties WHERE ${BASE_WHERE}`).get(...BASE_PARAMS)?.c ?? 0) : 0;
+    const enriched = db ? db.prepare("SELECT COUNT(*) as c FROM enrichment").get().c : 0;
+    res.json({ ok: true, properties: props, enrichments: enriched });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || "health failed" });
+  }
+});
+
 // =============================================================================
 // API ROUTES — SYNC
 // =============================================================================
