@@ -1065,6 +1065,243 @@ app.get("/api/enrichment/stale", requireAuth, (req, res) => {
 });
 
 // =============================================================================
+// ONE-TIME: Full AI enrichment for all type=vakantiewoning
+// =============================================================================
+function normalizePhoneForGroup(s) {
+  if (!s || typeof s !== "string") return "";
+  return s.replace(/\D/g, "").slice(-9) || s.replace(/\D/g, "");
+}
+
+function buildFullEnrichmentPrompt(property, portfolioInfo) {
+  const portfolioContext = portfolioInfo
+    ? `\nBELANGRIJK - PORTFOLIO EIGENAAR: Deze eigenaar heeft ${portfolioInfo.count} panden: ${portfolioInfo.names.join(", ")}\nDit is een HOGE PRIORITEIT portfolio lead. Verwerk dit expliciet in de openingszin.`
+    : "";
+  const name = property.name || "onbekend";
+  const street = property.street || "";
+  const postalCode = property.postalCode || "";
+  const municipality = property.municipality || "onbekend";
+  const province = property.province || "";
+  const status = property.status || "";
+  const starRating = property.starRating || "geen";
+  const sleepPlaces = property.sleepPlaces ?? property.slaapplaatsen ?? "?";
+  const units = property.units ?? 1;
+  const phone = property.phone || "niet beschikbaar";
+  const email = property.email || "niet beschikbaar";
+  const website = property.website || "niet gevonden";
+  const websiteStep = website ? `6. web_fetch "${website}" → controleer HTTP status. Als 200 met echte verhuurcontent: werkt=true en zoek foto URLs. Bij fout/parkeerdomein: werkt=false, gevonden=false.` : "";
+
+  return `Je bent een verkoopintelligentie-assistent voor yourdomi.be, een Belgisch beheerbedrijf voor kortetermijnverhuur (Airbnb, Booking.com, VRBO).
+VERKOOPSFILOSOFIE: Wij stellen vragen ipv uitleggen wie we zijn. We laten eigenaars zichzelf "verkopen" door te vragen naar hun situatie, pijnpunten en wensen. Goede verkopers luisteren 70%, spreken 30%.${portfolioContext}
+
+Pandgegevens uit Toerisme Vlaanderen register:
+- Naam: ${name}
+- Adres: ${street}, ${postalCode} ${municipality}, ${province}
+- Status: ${status} | Sterren: ${starRating} | Slaapplaatsen: ${sleepPlaces} | Units: ${units}
+- Tel: ${phone} | Email: ${email} | Website: ${website}
+
+STAP 1 - Online aanwezigheid zoeken (VERPLICHT - gebruik web_search + web_fetch):
+Zoek systematisch met deze queries (doe elke zoekactie apart):
+1. web_search: "${(name || "").slice(0, 40)} ${municipality} Airbnb" → zoek exacte Airbnb listing URL (airbnb.com/rooms/...)
+2. web_search: "${(name || "").slice(0, 40)} ${municipality} Booking.com" → zoek exacte Booking URL (booking.com/hotel/...)
+3. web_search: "${(name || "").slice(0, 40)} ${municipality} vakantiewoning" → zoek directe website
+4. Als Airbnb URL gevonden: web_fetch de listing pagina → extraheer foto URLs (a0.muscache.com CDN), prijs, beoordeling, en inhoud van gastreviews (tekst of snippets).
+5. Als Booking URL gevonden: web_fetch de listing pagina → extraheer foto URLs (cf.bstatic.com CDN), prijs, beoordeling, en inhoud van gastreviews.
+${websiteStep ? websiteStep + "\n\n" : ""}REVIEWS VOOR VERKOOPGESPREK: Als je een Airbnb- of Booking-listing hebt opgehaald, analyseer de gastreviews (of review-snippets op de pagina / in zoekresultaten). Zoek terugkerende thema's die we in het verkoopgesprek kunnen gebruiken, bv.: slechte of inconsistente schoonmaak, lawaai/geluid, parkeren, trage of slechte communicatie, ontbrekende voorzieningen, prijs/kwaliteit. Geef 2-5 korte punten in "reviewThemes" (Nederlands). Geen punten = lege array.
+
+BELANGRIJK voor websites:
+- Voeg ALLEEN een website toe als je deze effectief hebt kunnen ophalen via web_fetch en hij HTTP 200 teruggeeft met echte vakantieverhuur content
+- Als de fetch faalt (timeout, 404, 403, redirect naar parkeerdomein), zet directWebsite.werkt = false en directWebsite.gevonden = false
+- Parkeer/placeholder sites (bv. "This domain is for sale", Sedo, GoDaddy) tellen NIET als werkende website
+- Zet directWebsite.poorlyBuilt = true als de site WEL werkt maar slecht is: verouderd design, kapotte layout, geen boekingsmogelijkheid, amateuraanpak. Dat is een HEET-signaal (eigenaar kan baat hebben bij yourdomi).
+- Geef ECHTE foto URLs terug die je hebt gevonden via web_fetch op de listing pagina (airbnb CDN: a0.muscache.com, booking CDN: cf.bstatic.com) - geen placeholders
+- Als je geen foto URLs kan extraheren uit de pagina inhoud, geef een lege array terug
+
+STAP 2 - Agentuur detectie:
+Analyseer of het telefoonnummer/email waarschijnlijk een beheerskantoor/agentuur is ipv de eigenaar zelf. Signalen: generiek emaildomein, bekende vastgoedkantoren, meerdere panden op hetzelfde nr, "info@" adressen van vakantieverhuurders.
+
+STAP 3 - Consultieve gespreksstructuur:
+Maak 5-7 open vragen die de eigenaar aan het woord laten. Begin met de situatie peilen, dan pijnpunten, dan wensen. NIET pitchen, NIET uitleggen - VRAGEN. Structuur: situatievragen -> implicatievragen -> wensvragen.
+
+SCORE CRITERIA (volg dit strikt):
+🔥 HEET = Eigenaar beheert ZELF (geen agentuur), heeft directe contactgegevens, pand is NIET of slecht online (kans om waarde te tonen), OF staat al online maar heeft lage reviews/slechte prijszetting (duidelijke pijnpunten). Een SLECHT GEBOUWDE WEBSITE (verouderd, kapotte layout, geen boekingsmogelijkheid) telt als extra HEET-signaal.
+W WARM = Eigenaar beheert zelf maar is al redelijk goed online. Of: contactgegevens beschikbaar maar onduidelijk of zelf beheert. Bellen loont maar minder urgent.
+K KOUD = Duidelijk al professioneel beheerd (agentuur gedetecteerd), geen contactgegevens, of pand is al perfect geoptimaliseerd zonder ruimte voor yourdomi.
+
+PRIORITEIT: Geef 1-10. Als er een Airbnb- of Booking.com-listing is gevonden, tel +2 bij de prioriteit (max 10) zodat onze bellers deze eigenaars sneller kunnen contacteren.
+
+Geef ALLEEN deze JSON (geen markdown):
+{
+  "score": "HEET"|"WARM"|"KOUD",
+  "scoreReden": "Concrete reden op basis van de criteria: waarom precies HEET/WARM/KOUD? Vermeld specifiek: beheert zelf of agentuur? Online aanwezig of niet? Ruimte voor verbetering? Max 2 zinnen.",
+  "prioriteit": 1-10,
+  "openingszin": "Als NIET online gevonden: stel meteen een vraag of ze online zichtbaar zijn en waar ze staan. Als WEL gevonden: verwijs concreet naar hun listing/locatie/portfolio. Max 2 zinnen. NOOIT jezelf introduceren als 'wij zijn...', altijd starten vanuit hun situatie.",
+  "consultieveVragen": ["Vraag 1...", "Vraag 2...", "..."],
+  "waarschuwingAgentuur": true|false,
+  "agentuurSignalen": "Uitleg of leeg",
+  "pitchhoek": "Na de vragen: wat biedt yourdomi specifiek voor DEZE eigenaar. 2 zinnen.",
+  "zwaktes": ["verbeterpunt 1", "verbeterpunt 2", "..."],
+  "reviewThemes": ["terugkerend punt uit reviews", "..."],
+  "airbnb": { "gevonden": true|false, "url": "...", "beoordeling": "...", "aantalReviews": "...", "prijsPerNacht": "...", "bezettingsgraad": "...", "fotoUrls": [] },
+  "booking": { "gevonden": true|false, "url": "...", "beoordeling": "...", "aantalReviews": "...", "prijsPerNacht": "...", "fotoUrls": [] },
+  "directWebsite": { "gevonden": true|false, "werkt": true|false, "poorlyBuilt": true|false, "url": "...", "fotoUrls": [] },
+  "alleFotos": [],
+  "geschatMaandelijksInkomen": "...",
+  "geschatBezetting": "...",
+  "inkomensNota": "...",
+  "potentieelMetYourDomi": "...",
+  "potentieelNota": "...",
+  "locatieHighlights": [],
+  "eigenaarProfiel": "...",
+  "contractadvies": "full"|"partial"|"visibility",
+  "contractUitleg": "..."
+}`;
+}
+
+let fullAiVakantiewoningRunning = false;
+
+async function runOneFullEnrichment(property, portfolioInfo) {
+  const prompt = buildFullEnrichmentPrompt(property, portfolioInfo);
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 2500,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [{ role: "user", content: prompt }],
+      }),
+      signal: AbortSignal.timeout(120000),
+    });
+    const data = await r.json();
+    const textBlock = [...(data.content || [])].reverse().find((c) => c.type === "text");
+    const raw = textBlock?.text || "{}";
+    const clean = raw.replace(/```json|```/g, "").trim();
+    const s = clean.indexOf("{");
+    const e = clean.lastIndexOf("}");
+    return JSON.parse(clean.slice(s, e + 1));
+  } catch (e) {
+    console.warn("[full-ai-vakantiewoning] Error for", property.id, e.message);
+    return {
+      score: "WARM",
+      scoreReden: "Analyse mislukt: " + (e.message || "timeout"),
+      prioriteit: 5,
+      openingszin: `Goedemiddag, ik bel over uw vakantiewoning in ${property.municipality || "België"}.`,
+      pitchhoek: "yourdomi.be kan uw kortetermijnverhuur volledig beheren.",
+      zwaktes: [],
+      reviewThemes: [],
+      airbnb: { gevonden: false },
+      booking: { gevonden: false },
+      directWebsite: { gevonden: false },
+      alleFotos: [],
+      geschatMaandelijksInkomen: "Onbekend",
+      geschatBezetting: "Onbekend",
+      inkomensNota: "",
+      potentieelMetYourDomi: "Onbekend",
+      potentieelNota: "",
+      locatieHighlights: [],
+      eigenaarProfiel: "",
+      consultieveVragen: [],
+      waarschuwingAgentuur: false,
+      agentuurSignalen: "",
+      contractadvies: "partial",
+      contractUitleg: "",
+    };
+  }
+}
+
+app.post("/api/admin/run-full-ai-vakantiewoning", requireAuth, async (req, res) => {
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "ANTHROPIC_KEY not set" });
+  if (fullAiVakantiewoningRunning) return res.status(409).json({ error: "Job already running" });
+  if (!db) return res.status(500).json({ error: "Database not ready" });
+
+  const rows = db
+    .prepare(
+      `SELECT id, data, name, municipality, province, status, slaapplaatsen, phone, phone2, email, website, type, regio, date_online, postal_code, street
+       FROM properties
+       WHERE LOWER(TRIM(COALESCE(type, ''))) LIKE '%vakantiewoning%'
+       ORDER BY name ASC`
+    )
+    .all();
+
+  const properties = rows.map((r) => {
+    let parsed = {};
+    try {
+      if (r.data) parsed = JSON.parse(r.data);
+    } catch (_) {}
+    const fromRaw = parsed.raw && Array.isArray(parsed.included) ? parseLodging(parsed.raw, parsed.included) : null;
+    const p = fromRaw || parsed;
+    return {
+      id: r.id,
+      name: r.name || p?.name || "Vakantiewoning",
+      street: r.street || p?.street || "",
+      postalCode: r.postal_code || p?.postalCode || "",
+      municipality: r.municipality || p?.municipality || "",
+      province: r.province || p?.province || "",
+      status: r.status || p?.status || "",
+      starRating: p?.starRating || null,
+      sleepPlaces: p?.sleepPlaces ?? r.slaapplaatsen ?? null,
+      slaapplaatsen: r.slaapplaatsen ?? p?.slaapplaatsen ?? null,
+      units: p?.units ?? 1,
+      phone: r.phone || p?.phone || null,
+      phone2: r.phone2 || p?.phone2 || null,
+      email: r.email || p?.email || null,
+      website: r.website || p?.website || null,
+      type: r.type || "",
+      toeristischeRegio: r.regio || p?.toeristischeRegio || "",
+      dateOnline: r.date_online || p?.dateOnline || "",
+    };
+  });
+
+  fullAiVakantiewoningRunning = true;
+  res.json({ started: true, total: properties.length, message: "Full AI enrichment started for all vakantiewoning. Check server logs for progress." });
+
+  const FULL_AI_PARALLEL = Math.min(parseInt(process.env.FULL_AI_PARALLEL || "2"), 4);
+  const FULL_AI_DELAY_MS = parseInt(process.env.FULL_AI_DELAY_MS || "3000", 10);
+  const insert = db.prepare("INSERT OR REPLACE INTO enrichment (id, data, enriched_at) VALUES (?,?,?)");
+
+  (async () => {
+    const phoneGroups = new Map();
+    for (const prop of properties) {
+      const key = normalizePhoneForGroup(prop.phone || prop.phone2);
+      if (!key) continue;
+      if (!phoneGroups.has(key)) phoneGroups.set(key, []);
+      phoneGroups.get(key).push(prop.id);
+    }
+    const portfolioByKey = new Map();
+    for (const [key, ids] of phoneGroups) {
+      if (ids.length > 1) portfolioByKey.set(key, { count: ids.length, names: ids.map((id) => properties.find((p) => p.id === id)?.name || id) });
+    }
+
+    for (let i = 0; i < properties.length; i += FULL_AI_PARALLEL) {
+      const chunk = properties.slice(i, i + FULL_AI_PARALLEL);
+      const results = await Promise.all(
+        chunk.map((prop) => {
+          const key = normalizePhoneForGroup(prop.phone || prop.phone2);
+          const portfolioInfo = portfolioByKey.get(key) || null;
+          return runOneFullEnrichment(prop, portfolioInfo).then((data) => ({ id: prop.id, data }));
+        })
+      );
+      const now = Date.now();
+      for (const { id, data } of results) {
+        insert.run(id, JSON.stringify(data), now);
+        console.log("[full-ai-vakantiewoning] Enriched", id, "(", i + results.length, "/", properties.length, ")");
+      }
+      if (i + FULL_AI_PARALLEL < properties.length) await new Promise((r) => setTimeout(r, FULL_AI_DELAY_MS));
+    }
+    fullAiVakantiewoningRunning = false;
+    console.log("[full-ai-vakantiewoning] Done. Total enriched:", properties.length);
+  })().catch((e) => {
+    fullAiVakantiewoningRunning = false;
+    console.error("[full-ai-vakantiewoning] Job failed:", e.message);
+  });
+});
+
+// =============================================================================
 // PLATFORM SCAN — light AI across list: website + Airbnb + Booking only (no button)
 // =============================================================================
 app.get("/api/platform-scan", requireAuth, (req, res) => {
