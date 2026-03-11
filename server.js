@@ -1313,7 +1313,16 @@ async function runLightScanBatch() {
   const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
   const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
   const allIds = db.prepare("SELECT id, name, municipality, website FROM properties").all();
-  const toScan = allIds.filter(r => !scanned.has(r.id) || stale.includes(r.id)).slice(0, PLATFORM_SCAN_BATCH);
+  let toScan = allIds.filter(r => !scanned.has(r.id) || stale.includes(r.id));
+  const w = (s) => (s || "").toLowerCase();
+  toScan.sort((a, b) => {
+    const aHas = w(a.website).includes("airbnb.com") || w(a.website).includes("booking.com");
+    const bHas = w(b.website).includes("airbnb.com") || w(b.website).includes("booking.com");
+    if (aHas && !bHas) return -1;
+    if (!aHas && bHas) return 1;
+    return 0;
+  });
+  toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
   if (toScan.length === 0) return;
   const insert = db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)");
   const now = Date.now();
@@ -1331,6 +1340,86 @@ async function runLightScanBatch() {
     }
   }
   console.log("[platform-scan] Scanned", toScan.length, "properties in parallel (website/Airbnb/Booking).");
+}
+
+// Image scrape: fetch listing pages (Airbnb/Booking/website) and extract photo URLs; store in platform_scan
+const IMAGE_SCRAPE_BATCH = Math.min(parseInt(process.env.IMAGE_SCRAPE_BATCH || "6"), 12);
+const IMAGE_SCRAPE_PARALLEL = Math.min(parseInt(process.env.IMAGE_SCRAPE_PARALLEL || "3"), 6);
+const PHOTO_DOMAINS = ["a0.muscache.com", "muscache.com", "cf.bstatic.com", "bstatic.com", "dynamicmedia", "images.unsplash.com", "imgur.com", "cloudinary.com"];
+
+function extractImageUrlsFromHtml(html, baseUrl) {
+  const urls = new Set();
+  const re = /<img[^>]+src=["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    let u = m[1].trim();
+    if (u.startsWith("//")) u = "https:" + u;
+    if (u.startsWith("/")) {
+      try { const b = new URL(baseUrl); u = b.origin + u; } catch (_) { continue; }
+    }
+    if (!u.startsWith("http")) continue;
+    if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(u) || PHOTO_DOMAINS.some(d => u.includes(d))) urls.add(u);
+  }
+  const re2 = /["'](https?:\/\/[^"']+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^"']*)?)["']/gi;
+  while ((m = re2.exec(html)) !== null) urls.add(m[1].trim());
+  return [...urls];
+}
+
+async function fetchImagesForUrls(urls) {
+  const all = [];
+  const ua = "Mozilla/5.0 (compatible; YourDomiBot/1.0)";
+  for (const url of urls.slice(0, 3)) {
+    if (!url || !url.startsWith("http")) continue;
+    try {
+      const r = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(12000) });
+      const html = await r.text();
+      all.push(...extractImageUrlsFromHtml(html, url));
+    } catch (_) {}
+  }
+  const seen = new Set();
+  return all.filter(u => { if (seen.has(u)) return false; seen.add(u); return true; }).slice(0, 24);
+}
+
+async function runImageScrapeBatch() {
+  if (!db) return;
+  const rows = db.prepare("SELECT id, data FROM platform_scan").all();
+  const props = new Map(db.prepare("SELECT id, website FROM properties").all().map(r => [r.id, r.website]));
+  const toScrape = [];
+  for (const row of rows) {
+    let data;
+    try { data = JSON.parse(row.data); } catch { continue; }
+    if (data.fotoUrls && data.fotoUrls.length > 0) continue;
+    const urls = [];
+    if (data.airbnb?.url) urls.push(data.airbnb.url);
+    if (data.booking?.url) urls.push(data.booking.url);
+    if (data.website?.url) urls.push(data.website.url);
+    const pw = (props.get(row.id) || "").trim();
+    if (pw && pw.startsWith("http") && !urls.includes(pw)) {
+      if (pw.toLowerCase().includes("airbnb.com") || pw.toLowerCase().includes("booking.com")) urls.push(pw);
+      else if (!data.website?.url) urls.push(pw);
+    }
+    if (urls.length === 0) continue;
+    toScrape.push({ id: row.id, urls });
+  }
+  if (toScrape.length === 0) return;
+  const batch = toScrape.slice(0, IMAGE_SCRAPE_BATCH);
+  const update = db.prepare("UPDATE platform_scan SET data = ?, scanned_at = ? WHERE id = ?");
+  for (let i = 0; i < batch.length; i += IMAGE_SCRAPE_PARALLEL) {
+    const chunk = batch.slice(i, i + IMAGE_SCRAPE_PARALLEL);
+    const results = await Promise.all(chunk.map(async ({ id, urls }) => {
+      const fotoUrls = await fetchImagesForUrls(urls);
+      const row = db.prepare("SELECT data FROM platform_scan WHERE id = ?").get(id);
+      let data = {};
+      try { data = row ? JSON.parse(row.data) : {}; } catch (_) {}
+      data.fotoUrls = fotoUrls;
+      return { id, data };
+    }));
+    for (const { id, data } of results) {
+      update.run(JSON.stringify(data), Date.now(), id);
+    }
+    if (i + IMAGE_SCRAPE_PARALLEL < batch.length) await new Promise(r => setTimeout(r, 600));
+  }
+  console.log("[image-scrape] Fetched images for", batch.length, "properties.");
 }
 
 app.post("/api/monday", requireAuth, async (req, res) => {
@@ -1427,11 +1516,15 @@ async function startServer() {
     }
     if (process.env.PLATFORM_SCAN_ENABLED === "1" && ANTHROPIC_KEY) {
       setTimeout(() => {
-        runLightScanBatch().then(() => {
-          const interval = setInterval(runLightScanBatch, 2 * 60 * 1000);
-          interval.unref?.();
-        }).catch(console.error);
-        console.log("[startup] Platform scan (website/Airbnb/Booking) enabled — running in background.");
+        const runBoth = () => {
+          runLightScanBatch()
+            .then(() => runImageScrapeBatch())
+            .catch(console.error);
+        };
+        runBoth();
+        const interval = setInterval(runBoth, 2 * 60 * 1000);
+        interval.unref?.();
+        console.log("[startup] Platform scan + image scrape enabled — running in background.");
       }, 15000);
     }
   });
