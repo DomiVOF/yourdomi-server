@@ -19,6 +19,41 @@ const DB_PATH = process.env.DB_PATH || "/data/yourdomi.db";
 let db;
 
 // =============================================================================
+// BACKGROUND AGENTS RUNNER (Airbnb, Booking, website, pictures)
+// NOTE: These can only run while the Railway container is awake.
+// If Railway scales to zero / sleeps on no traffic, nothing runs until it wakes up.
+// =============================================================================
+let backgroundAgentsRunning = false;
+async function runAllBackgroundAgentsOnce() {
+  if (process.env.PLATFORM_SCAN_ENABLED !== "1") return;
+  if (!ANTHROPIC_KEY || !db) return;
+  if (backgroundAgentsRunning) return;
+  backgroundAgentsRunning = true;
+  try {
+    await Promise.all([
+      runAirbnbAgentBatch(),
+      runBookingAgentBatch(),
+      runWebsiteAgentBatch(),
+      runImageScrapeBatch(),
+    ]);
+  } finally {
+    backgroundAgentsRunning = false;
+  }
+}
+
+async function runBackgroundBurst() {
+  const cycles = Math.min(parseInt(process.env.BACKGROUND_BURST_CYCLES || "3", 10), 12);
+  const maxMs = Math.min(parseInt(process.env.BACKGROUND_BURST_MAX_MS || "170000", 10), 600000);
+  const sleepMs = Math.max(0, parseInt(process.env.BACKGROUND_BURST_SLEEP_MS || "8000", 10));
+  const started = Date.now();
+  for (let i = 0; i < cycles; i++) {
+    if (Date.now() - started > maxMs) break;
+    await runAllBackgroundAgentsOnce();
+    if (i < cycles - 1 && sleepMs > 0) await new Promise(r => setTimeout(r, sleepMs));
+  }
+}
+
+// =============================================================================
 // DATABASE
 // =============================================================================
 function initDb(dbPath) {
@@ -1064,6 +1099,20 @@ app.get("/api/enrichment/stale", requireAuth, (req, res) => {
   res.json({ stale: [...stale, ...unenriched].slice(0, 200) });
 });
 
+// POST /api/admin/run-background-agents — manual trigger (useful for Railway Cron)
+// Security: requires ADMIN_PASSWORD (does not rely on logged-in browser session).
+app.post("/api/admin/run-background-agents", (req, res) => {
+  const adminPw = process.env.ADMIN_PASSWORD;
+  if (!adminPw) return res.status(403).json({ error: "ADMIN_PASSWORD not set" });
+  const provided = (req.body && (req.body.adminPassword || req.body.password)) || req.headers["x-admin-password"];
+  if (String(provided || "") !== String(adminPw)) return res.status(403).json({ error: "Wrong admin password" });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "ANTHROPIC_KEY not configured" });
+  if (!db) return res.status(500).json({ error: "Database not ready" });
+  runAllBackgroundAgentsOnce()
+    .then(() => res.json({ ok: true }))
+    .catch((e) => res.status(500).json({ error: e.message }));
+});
+
 // =============================================================================
 // ONE-TIME: Full AI enrichment for all type=vakantiewoning
 // =============================================================================
@@ -1510,6 +1559,69 @@ function mergePlatformScan(db, id, partial) {
   db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)").run(id, JSON.stringify(merged), now);
 }
 
+// Per-field staleness/backoff so agents can work efficiently in short wake windows.
+const AGENT_STALE_DAYS_AIRBNB  = parseInt(process.env.AGENT_STALE_DAYS_AIRBNB  || "14", 10);
+const AGENT_STALE_DAYS_BOOKING = parseInt(process.env.AGENT_STALE_DAYS_BOOKING || "14", 10);
+const AGENT_STALE_DAYS_WEBSITE = parseInt(process.env.AGENT_STALE_DAYS_WEBSITE || "30", 10);
+const AGENT_STALE_DAYS_IMAGES  = parseInt(process.env.AGENT_STALE_DAYS_IMAGES  || "30", 10);
+
+function backoffDays(baseDays, failCount) {
+  const f = Math.max(0, parseInt(failCount || 0, 10));
+  if (f <= 1) return baseDays;
+  if (f === 2) return Math.min(90, baseDays * 2);
+  return Math.min(90, baseDays * 4);
+}
+
+function needsRescan(checkedAt, baseDays, failCount) {
+  if (!checkedAt) return true;
+  const age = Date.now() - Number(checkedAt);
+  const days = backoffDays(baseDays, failCount) * 86400000;
+  return age > days;
+}
+
+function scanMeta(data) {
+  const m = (data && data._meta && typeof data._meta === "object") ? data._meta : {};
+  return {
+    airbnbCheckedAt: m.airbnbCheckedAt || null,
+    bookingCheckedAt: m.bookingCheckedAt || null,
+    websiteCheckedAt: m.websiteCheckedAt || null,
+    imagesCheckedAt: m.imagesCheckedAt || null,
+    airbnbFailCount: m.airbnbFailCount || 0,
+    bookingFailCount: m.bookingFailCount || 0,
+    websiteFailCount: m.websiteFailCount || 0,
+    imagesFailCount: m.imagesFailCount || 0,
+  };
+}
+
+function updateMetaFor(data, kind, ok) {
+  const now = Date.now();
+  const m = scanMeta(data);
+  const meta = { ...(data && data._meta && typeof data._meta === "object" ? data._meta : {}) };
+  if (kind === "airbnb") {
+    meta.airbnbCheckedAt = now;
+    meta.airbnbFailCount = ok ? 0 : (m.airbnbFailCount + 1);
+  } else if (kind === "booking") {
+    meta.bookingCheckedAt = now;
+    meta.bookingFailCount = ok ? 0 : (m.bookingFailCount + 1);
+  } else if (kind === "website") {
+    meta.websiteCheckedAt = now;
+    meta.websiteFailCount = ok ? 0 : (m.websiteFailCount + 1);
+  } else if (kind === "images") {
+    meta.imagesCheckedAt = now;
+    meta.imagesFailCount = ok ? 0 : (m.imagesFailCount + 1);
+  }
+  return { ...(data || {}), _meta: meta };
+}
+
+function loadPlatformScanMap() {
+  const rows = db.prepare("SELECT id, data FROM platform_scan").all();
+  const map = new Map();
+  for (const r of rows) {
+    try { map.set(r.id, JSON.parse(r.data)); } catch { map.set(r.id, {}); }
+  }
+  return map;
+}
+
 async function runOneAirbnbScan(id, name, municipality) {
   const prompt = `Vakantieverhuur België: Naam: ${name || "onbekend"}, Gemeente: ${municipality || "onbekend"}. Zoek met web_search: "${(name || "").slice(0, 40)} ${(municipality || "").slice(0, 30)} Airbnb". Geef ALLEEN JSON: { "airbnb": { "gevonden": true|false, "url": "https://www.airbnb.com/rooms/..." of null } }`;
   try {
@@ -1588,17 +1700,25 @@ function agentTier(row, kind) {
 
 async function runAirbnbAgentBatch() {
   if (!ANTHROPIC_KEY || !db) return;
-  const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
-  const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
-  const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
+  const scanMap = loadPlatformScanMap();
   const all = db.prepare("SELECT id, name, municipality, website FROM properties").all();
-  let toScan = all.filter(r => (agentTier(r, "airbnb")) && (!scanned.has(r.id) || stale.includes(r.id)));
+  let toScan = all.filter(r => {
+    if (!agentTier(r, "airbnb")) return false;
+    const data = scanMap.get(r.id) || {};
+    const meta = scanMeta(data);
+    const hasUrl = !!(data.airbnb && data.airbnb.url);
+    return !hasUrl && needsRescan(meta.airbnbCheckedAt, AGENT_STALE_DAYS_AIRBNB, meta.airbnbFailCount);
+  });
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
   if (toScan.length === 0) return;
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneAirbnbScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
-    for (const { id, data } of results) mergePlatformScan(db, id, data);
+    for (const { id, data } of results) {
+      const prev = scanMap.get(id) || {};
+      const ok = !!(data?.airbnb?.gevonden && data?.airbnb?.url);
+      mergePlatformScan(db, id, updateMetaFor({ ...prev, ...data }, "airbnb", ok));
+    }
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[agent-airbnb] Scanned", toScan.length, "listings.");
@@ -1606,17 +1726,25 @@ async function runAirbnbAgentBatch() {
 
 async function runBookingAgentBatch() {
   if (!ANTHROPIC_KEY || !db) return;
-  const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
-  const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
-  const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
+  const scanMap = loadPlatformScanMap();
   const all = db.prepare("SELECT id, name, municipality, website FROM properties").all();
-  let toScan = all.filter(r => agentTier(r, "booking") && (!scanned.has(r.id) || stale.includes(r.id)));
+  let toScan = all.filter(r => {
+    if (!agentTier(r, "booking")) return false;
+    const data = scanMap.get(r.id) || {};
+    const meta = scanMeta(data);
+    const hasUrl = !!(data.booking && data.booking.url);
+    return !hasUrl && needsRescan(meta.bookingCheckedAt, AGENT_STALE_DAYS_BOOKING, meta.bookingFailCount);
+  });
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
   if (toScan.length === 0) return;
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneBookingScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
-    for (const { id, data } of results) mergePlatformScan(db, id, data);
+    for (const { id, data } of results) {
+      const prev = scanMap.get(id) || {};
+      const ok = !!(data?.booking?.gevonden && data?.booking?.url);
+      mergePlatformScan(db, id, updateMetaFor({ ...prev, ...data }, "booking", ok));
+    }
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[agent-booking] Scanned", toScan.length, "listings.");
@@ -1624,17 +1752,25 @@ async function runBookingAgentBatch() {
 
 async function runWebsiteAgentBatch() {
   if (!ANTHROPIC_KEY || !db) return;
-  const scanned = new Set(db.prepare("SELECT id FROM platform_scan").all().map(r => r.id));
-  const cutoff = Date.now() - PLATFORM_SCAN_DAYS * 86400000;
-  const stale = db.prepare("SELECT id FROM platform_scan WHERE scanned_at < ?").all(cutoff).map(r => r.id);
+  const scanMap = loadPlatformScanMap();
   const all = db.prepare("SELECT id, name, municipality, website FROM properties").all();
-  let toScan = all.filter(r => !agentTier(r, "airbnb") && !agentTier(r, "booking") && (!scanned.has(r.id) || stale.includes(r.id)));
+  let toScan = all.filter(r => {
+    if (agentTier(r, "airbnb") || agentTier(r, "booking")) return false;
+    const data = scanMap.get(r.id) || {};
+    const meta = scanMeta(data);
+    const hasUrl = !!(data.website && data.website.url);
+    return !hasUrl && needsRescan(meta.websiteCheckedAt, AGENT_STALE_DAYS_WEBSITE, meta.websiteFailCount);
+  });
   toScan = toScan.slice(0, PLATFORM_SCAN_BATCH);
   if (toScan.length === 0) return;
   for (let i = 0; i < toScan.length; i += PLATFORM_SCAN_PARALLEL) {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneWebsiteScan(row.id, row.name, row.municipality, row.website).then(data => ({ id: row.id, data }))));
-    for (const { id, data } of results) mergePlatformScan(db, id, data);
+    for (const { id, data } of results) {
+      const prev = scanMap.get(id) || {};
+      const ok = !!(data?.website?.gevonden && data?.website?.url);
+      mergePlatformScan(db, id, updateMetaFor({ ...prev, ...data }, "website", ok));
+    }
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
   console.log("[agent-website] Scanned", toScan.length, "listings.");
@@ -1666,10 +1802,11 @@ function extractImageUrlsFromHtml(html, baseUrl) {
 async function fetchImagesForUrls(urls) {
   const all = [];
   const ua = "Mozilla/5.0 (compatible; YourDomiBot/1.0)";
+  const timeoutMs = Math.min(parseInt(process.env.IMAGE_FETCH_TIMEOUT_MS || "10000", 10), 20000);
   for (const url of urls.slice(0, 3)) {
     if (!url || !url.startsWith("http")) continue;
     try {
-      const r = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(12000) });
+      const r = await fetch(url, { headers: { "User-Agent": ua }, signal: AbortSignal.timeout(timeoutMs) });
       const html = await r.text();
       all.push(...extractImageUrlsFromHtml(html, url));
     } catch (_) {}
@@ -1694,7 +1831,9 @@ async function runImageScrapeBatch() {
   for (const row of rows) {
     let data;
     try { data = JSON.parse(row.data); } catch { continue; }
-    if (data.fotoUrls && data.fotoUrls.length > 0) continue;
+    const meta = scanMeta(data);
+    if (Array.isArray(data.fotoUrls) && data.fotoUrls.length > 0) continue;
+    if (!needsRescan(meta.imagesCheckedAt, AGENT_STALE_DAYS_IMAGES, meta.imagesFailCount)) continue;
     const urls = [];
     if (data.airbnb?.url) urls.push(data.airbnb.url);
     if (data.booking?.url) urls.push(data.booking.url);
@@ -1719,6 +1858,8 @@ async function runImageScrapeBatch() {
       let data = {};
       try { data = row ? JSON.parse(row.data) : {}; } catch (_) {}
       data.fotoUrls = fotoUrls;
+      const ok = Array.isArray(fotoUrls) && fotoUrls.length > 0;
+      data = updateMetaFor(data, "images", ok);
       return { id, data };
     }));
     for (const { id, data } of results) {
@@ -1823,21 +1964,28 @@ async function startServer() {
     }
     if (process.env.PLATFORM_SCAN_ENABLED === "1" && ANTHROPIC_KEY) {
       setTimeout(() => {
-        const runAllAgents = () => {
-          Promise.all([
-            runAirbnbAgentBatch(),
-            runBookingAgentBatch(),
-            runWebsiteAgentBatch(),
-            runImageScrapeBatch(),
-          ]).catch(console.error);
-        };
-        runAllAgents();
+        const runAllAgents = () => runAllBackgroundAgentsOnce().catch(console.error);
+        // Burst on wake/startup so we make progress even if the container idles again.
+        runBackgroundBurst().catch(console.error);
         const interval = setInterval(runAllAgents, 2 * 60 * 1000);
         interval.unref?.();
         console.log("[startup] Four background agents enabled (Airbnb, Booking, website, pictures) — running in parallel every 2 min.");
       }, 15000);
     }
   });
+}
+
+// Optional cron trigger (still requires the container to be awake).
+// Example: BACKGROUND_AGENTS_CRON="*/2 * * * *"
+if (process.env.BACKGROUND_AGENTS_CRON && process.env.PLATFORM_SCAN_ENABLED === "1") {
+  try {
+    cron.schedule(process.env.BACKGROUND_AGENTS_CRON, () => {
+      runAllBackgroundAgentsOnce().catch(console.error);
+    });
+    console.log("[startup] BACKGROUND_AGENTS_CRON enabled:", process.env.BACKGROUND_AGENTS_CRON);
+  } catch (e) {
+    console.warn("[startup] Invalid BACKGROUND_AGENTS_CRON:", e.message);
+  }
 }
 
 startServer().catch(console.error);
