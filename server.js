@@ -1559,6 +1559,16 @@ function mergePlatformScan(db, id, partial) {
   db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)").run(id, JSON.stringify(merged), now);
 }
 
+// Agent-safe merge: read latest row once, update only the agent field + _meta, write back.
+// This avoids using a stale snapshot for merging and prevents overwriting fields written by other agents.
+function mergePlatformScanAgentUpdate(db, id, partial, kind, ok) {
+  const current = getPlatformScanRow(db, id);
+  const updated = updateMetaFor(current, kind, ok);
+  const merged = { ...current, ...partial, _meta: updated._meta };
+  const now = Date.now();
+  db.prepare("INSERT OR REPLACE INTO platform_scan (id, data, scanned_at) VALUES (?,?,?)").run(id, JSON.stringify(merged), now);
+}
+
 // Per-field staleness/backoff so agents can work efficiently in short wake windows.
 const AGENT_STALE_DAYS_AIRBNB  = parseInt(process.env.AGENT_STALE_DAYS_AIRBNB  || "14", 10);
 const AGENT_STALE_DAYS_BOOKING = parseInt(process.env.AGENT_STALE_DAYS_BOOKING || "14", 10);
@@ -1715,9 +1725,8 @@ async function runAirbnbAgentBatch() {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneAirbnbScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
     for (const { id, data } of results) {
-      const prev = scanMap.get(id) || {};
       const ok = !!(data?.airbnb?.gevonden && data?.airbnb?.url);
-      mergePlatformScan(db, id, updateMetaFor({ ...prev, ...data }, "airbnb", ok));
+      mergePlatformScanAgentUpdate(db, id, { airbnb: data.airbnb }, "airbnb", ok);
     }
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
@@ -1741,9 +1750,8 @@ async function runBookingAgentBatch() {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneBookingScan(row.id, row.name, row.municipality).then(data => ({ id: row.id, data }))));
     for (const { id, data } of results) {
-      const prev = scanMap.get(id) || {};
       const ok = !!(data?.booking?.gevonden && data?.booking?.url);
-      mergePlatformScan(db, id, updateMetaFor({ ...prev, ...data }, "booking", ok));
+      mergePlatformScanAgentUpdate(db, id, { booking: data.booking }, "booking", ok);
     }
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
@@ -1767,9 +1775,8 @@ async function runWebsiteAgentBatch() {
     const chunk = toScan.slice(i, i + PLATFORM_SCAN_PARALLEL);
     const results = await Promise.all(chunk.map(row => runOneWebsiteScan(row.id, row.name, row.municipality, row.website).then(data => ({ id: row.id, data }))));
     for (const { id, data } of results) {
-      const prev = scanMap.get(id) || {};
       const ok = !!(data?.website?.gevonden && data?.website?.url);
-      mergePlatformScan(db, id, updateMetaFor({ ...prev, ...data }, "website", ok));
+      mergePlatformScanAgentUpdate(db, id, { website: data.website }, "website", ok);
     }
     if (i + PLATFORM_SCAN_PARALLEL < toScan.length) await new Promise(r => setTimeout(r, 600));
   }
@@ -1832,8 +1839,10 @@ async function runImageScrapeBatch() {
     let data;
     try { data = JSON.parse(row.data); } catch { continue; }
     const meta = scanMeta(data);
-    if (Array.isArray(data.fotoUrls) && data.fotoUrls.length > 0) continue;
-    if (!needsRescan(meta.imagesCheckedAt, AGENT_STALE_DAYS_IMAGES, meta.imagesFailCount)) continue;
+    const hasFotos = Array.isArray(data.fotoUrls) && data.fotoUrls.length > 0;
+    const stale = needsRescan(meta.imagesCheckedAt, AGENT_STALE_DAYS_IMAGES, meta.imagesFailCount);
+    // Refresh when stale, even if fotos already exist. Skip only when not stale.
+    if (!stale) continue;
     const urls = [];
     if (data.airbnb?.url) urls.push(data.airbnb.url);
     if (data.booking?.url) urls.push(data.booking.url);
